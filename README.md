@@ -21,7 +21,7 @@ If you previously installed the local development bundle `@local/dsh-composer-pr
 
 ## Use it
 
-- **Next message.** After a completed reply, a suggestion may appear in the empty composer. Press **Tab** or use the button beside it to insert an editable draft. If the automatic attempt returns no suggestion, the sparkle button can make one manual attempt for that reply.
+- **Next message.** After a completed reply, a suggestion may appear in the empty composer. Press **Tab** or use the button beside it to insert an editable draft. If the automatic attempt finds no suggestion, the sparkle button offers one manual attempt. If a model request fails, the toolbar shows the reason and leaves the button available, up to three manual attempts total per reply. The plugin does not retry automatically.
 - **Improve draft.** With a plain-text draft, click the wand beside the composer controls. Compare the original and revised text, then choose **Replace draft** or **Keep original**. A stale preview cannot overwrite an edited draft. Commands and inline references or quotes are not rewritten.
 
 ## Data and costs

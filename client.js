@@ -71,7 +71,7 @@ window.__ModuleLoader__.load({
       }
       @keyframes dsh-next-message-spin { to { transform:rotate(360deg); } }
       .dsh-next-message-status { min-width:0; color:var(--dsw-alias-label-secondary);
-        font-size:.8em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        font-size:.8em; line-height:1.25; white-space:normal; overflow-wrap:anywhere; }
       .dsh-next-message-status:not([data-visible]) { position:absolute; width:1px; height:1px;
         overflow:hidden; clip-path:inset(50%); white-space:nowrap; }
     `;
@@ -91,23 +91,40 @@ window.__ModuleLoader__.load({
         for (const listener of entry.listeners) listener();
       }
 
-      async function request(sessionId, entry, retryTurn) {
-        const manual = retryTurn !== undefined;
+      const errorLabels = new Map([
+        ['timeout', 'suggestionTimeout'], ['rateLimited', 'suggestionRateLimited'],
+        ['modelError', 'suggestionModelError'], ['invalidResponse', 'suggestionInvalidResponse'],
+      ]);
+
+      async function request(sessionId, entry, manual = false, retry = null) {
         const params = new URLSearchParams({ session: sessionId });
-        if (manual) params.set('retry', String(retryTurn));
-        let result = { phase: manual ? 'failed' : 'unavailable' };
+        if (retry !== null) params.set('retry', retry);
+        // Resend the same key on network failure: Host joins/retrieves the same attempt.
+        let result = { phase: 'ready', retry, status: 'suggestionConnectionError' };
         try {
           const response = await fetch(`api/local-composer-predictions/next?${params}`, {
             method: 'POST', credentials: 'same-origin', signal: entry.controller.signal,
           });
-          const body = response.ok ? await response.json() : null;
-          if (typeof body?.suggestion === 'string' && body.suggestion.length > 0 && body.suggestion.length <= 180) {
-            result = { phase: 'suggestion', text: body.suggestion, manual };
-          } else if (!manual && Number.isSafeInteger(body?.retryTurn) && body.retryTurn >= 0) {
-            result = { phase: 'ready', retryTurn: body.retryTurn };
+          if (!response.ok) {
+            if (response.status === 429) {
+              result = { phase: 'ready', retry, status: 'suggestionRateLimited' };
+            } else if (response.status >= 400 && response.status < 500) {
+              result = { phase: 'finished', status: 'suggestionUnavailable' };
+            }
+          } else {
+            const body = await response.json();
+            const status = errorLabels.get(body?.reason);
+            if (typeof body?.suggestion === 'string' && body.suggestion.length > 0 && body.suggestion.length <= 180) {
+              result = { phase: 'suggestion', text: body.suggestion, manual };
+            } else if (typeof body?.retry === 'string' && /^\d+:\d+$/u.test(body.retry)) {
+              result = { phase: 'ready', retry: body.retry, status };
+            } else if (body?.suggestion === null && body.retry === null) {
+              result = { phase: 'finished', status: status ? 'suggestionAttemptsExhausted' : manual ? 'noSuggestion' : undefined,
+                detail: status };
+            }
           }
         } catch {
-          // The composer remains usable if the optional request fails.
+          // Do not surface raw transport errors or affect the composer.
         }
         if (!entry.controller.signal.aborted) publish(entry, result);
       }
@@ -129,11 +146,12 @@ window.__ModuleLoader__.load({
           };
         },
         snapshot: sessionId => entries.get(sessionId)?.state ?? initial,
-        retry(sessionId, retryTurn) {
+        retry(sessionId) {
           const entry = entries.get(sessionId);
-          if (entry?.state.phase !== 'ready' || entry.state.retryTurn !== retryTurn) return;
+          if (entry?.state.phase !== 'ready') return;
+          const { retry } = entry.state;
           publish(entry, { phase: 'manual' });
-          void request(sessionId, entry, retryTurn);
+          void request(sessionId, entry, true, retry);
         },
       };
     }
@@ -338,15 +356,16 @@ window.__ModuleLoader__.load({
       const empty = revision !== null;
       const ready = state.phase === 'ready';
       const busy = state.phase === 'auto' || state.phase === 'manual';
-      const failed = state.phase === 'failed';
-      const label = t(busy ? 'generating' : 'generate');
+      const status = state.status ? t(state.status) : '';
+      const detail = state.detail ? `${t(state.detail)} ${status}` : status;
+      const label = t(busy ? 'generating' : ready && status ? 'retrySuggestion' : 'generate');
 
       function generate() {
         if (!empty || !ready) return;
         const editor = button.current?.closest('[data-composer-card]')?.querySelector(editableSelector);
         if (!editor?.nextElementSibling?.matches(placeholderSelector)) return;
         if (editor.ownerDocument.activeElement !== editor) editor.focus({ preventScroll: true });
-        store.retry(sessionId, state.retryTurn);
+        store.retry(sessionId);
       }
 
       return h(React.Fragment, null,
@@ -359,9 +378,10 @@ window.__ModuleLoader__.load({
           : h('svg', { width: 15, height: 15, viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': true },
             h('path', { d: 'M8 1.75 9.6 6.4 14.25 8 9.6 9.6 8 14.25 6.4 9.6 1.75 8 6.4 6.4Z',
               stroke: 'currentColor', strokeWidth: 1.25, strokeLinejoin: 'round' }))),
-        h('span', { className: 'dsh-next-message-status', role: 'status', 'data-visible': failed && empty ? '' : undefined },
-          state.phase === 'manual' ? t('generating') : failed ? t('noSuggestion')
-            : state.phase === 'suggestion' && state.manual && empty ? t('suggestionReady') : ''));
+        h('span', { className: 'dsh-next-message-status', role: 'status',
+          title: empty && detail ? detail : undefined, 'data-visible': empty && detail ? '' : undefined },
+          !empty ? '' : detail || (state.phase === 'manual' ? t('generating')
+            : state.phase === 'suggestion' && state.manual ? t('suggestionReady') : '')));
     });
 
     const idleSession = session => session.openState === 'open' && session.subagent === null
@@ -381,6 +401,11 @@ window.__ModuleLoader__.load({
         ctx.effect(() => ctx.locale.register(namespace, {
           en: { insert: 'Insert suggested message', action: 'Insert', generate: 'Suggest a next message',
             generating: 'Generating suggestion…', noSuggestion: 'No suggestion this time', suggestionReady: 'Suggestion ready. Press Tab to insert.',
+            retrySuggestion: 'Retry suggestion', suggestionTimeout: 'The model did not respond within 12 seconds.',
+            suggestionRateLimited: 'The provider is limiting requests. Wait before retrying.',
+            suggestionModelError: 'The model request failed.', suggestionInvalidResponse: 'The model returned an unusable suggestion.',
+            suggestionConnectionError: 'Could not reach the suggestion service.', suggestionUnavailable: 'Suggestions are unavailable in this chat.',
+            suggestionAttemptsExhausted: 'No more attempts for this reply.',
             rewrite: 'Improve draft', rewriting: 'Preparing a clearer version…', rewriteReview: 'Compare the versions before replacing your draft.',
             original: 'Original', rewriteVariant: 'Suggested version', keepOriginal: 'Keep original', replaceDraft: 'Replace draft',
             rewriteError: 'Could not prepare a version. Your draft is unchanged.', rewriteSame: 'No changes suggested.',
@@ -389,6 +414,11 @@ window.__ModuleLoader__.load({
             rewriteStale: 'The draft changed. This version will not replace it.' },
           ru: { insert: 'Вставить подсказку', action: 'Вставить', generate: 'Предложить следующее сообщение',
             generating: 'Генерирую подсказку…', noSuggestion: 'Не удалось подобрать подсказку', suggestionReady: 'Подсказка готова. Нажмите Tab для вставки.',
+            retrySuggestion: 'Повторить генерацию подсказки', suggestionTimeout: 'Модель не ответила за 12 секунд.',
+            suggestionRateLimited: 'Провайдер ограничил запросы. Подожди и повтори.',
+            suggestionModelError: 'Запрос к модели завершился с ошибкой.', suggestionInvalidResponse: 'Модель вернула неподходящий ответ.',
+            suggestionConnectionError: 'Не удалось связаться со службой подсказок.', suggestionUnavailable: 'Подсказки в этом чате недоступны.',
+            suggestionAttemptsExhausted: 'Попытки для этого ответа закончились.',
             rewrite: 'Улучшить черновик', rewriting: 'Готовлю более ясный вариант…', rewriteReview: 'Сравните варианты, прежде чем заменять черновик.',
             original: 'Оригинал', rewriteVariant: 'Предложенный вариант', keepOriginal: 'Оставить оригинал', replaceDraft: 'Заменить черновик',
             rewriteError: 'Не удалось подготовить вариант. Черновик не изменился.', rewriteSame: 'Изменений не предложено.',
@@ -397,6 +427,11 @@ window.__ModuleLoader__.load({
             rewriteStale: 'Черновик изменился. Этот вариант не заменит его.' },
           zh: { insert: '插入建议消息', action: '插入', generate: '建议下一条消息',
             generating: '正在生成建议…', noSuggestion: '本次没有可用建议', suggestionReady: '建议已就绪。按 Tab 插入。',
+            retrySuggestion: '重试生成建议', suggestionTimeout: '模型在 12 秒内未响应。',
+            suggestionRateLimited: '模型提供方限制了请求，请稍后重试。',
+            suggestionModelError: '模型请求失败。', suggestionInvalidResponse: '模型返回的建议无法使用。',
+            suggestionConnectionError: '无法连接到建议服务。', suggestionUnavailable: '此对话暂不支持建议。',
+            suggestionAttemptsExhausted: '这条回复的尝试次数已用完。',
             rewrite: '润色草稿', rewriting: '正在准备更清晰的版本…', rewriteReview: '替换草稿前，请先比较两个版本。',
             original: '原文', rewriteVariant: '建议版本', keepOriginal: '保留原文', replaceDraft: '替换草稿',
             rewriteError: '无法生成建议版本，草稿未更改。', rewriteSame: '没有建议的改动。',

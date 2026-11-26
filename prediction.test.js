@@ -96,9 +96,10 @@ test('long runs with many text updates reserve one slot for the human prompt', (
 test('rejects absent, malformed, too long, multiline and command suggestions', () => {
   for (const output of ['{', '{"suggestion":null}', '{"suggestion":"/goal test"}', '{"suggestion":"Строка\\nвторая"}',
     '{"suggestion":"https://example.org"}', JSON.stringify({ suggestion: 'a'.repeat(181) })]) {
-    assert.equal(parsePrediction(output), null);
+    assert.deepEqual(parsePrediction(output), output === '{"suggestion":null}'
+      ? { suggestion: null } : { reason: 'invalidResponse' });
   }
-  assert.equal(parsePrediction('{"suggestion":"  Покажи второй вариант.  "}'), 'Покажи второй вариант.');
+  assert.deepEqual(parsePrediction('{"suggestion":"  Покажи второй вариант.  "}'), { suggestion: 'Покажи второй вариант.' });
 });
 
 test('settled turns generate one tool-free request and leave other sessions untouched', async () => {
@@ -115,7 +116,7 @@ test('settled turns generate one tool-free request and leave other sessions unto
   h.fire('session/event', session, rows[2]);
   assert.equal(await h.call('other'), null);
   assert.deepEqual(await Promise.all([h.call(), h.call()]), ['Покажи второй вариант', 'Покажи второй вариант']);
-  assert.deepEqual(await h.raw('test', '6'), { suggestion: null, retryTurn: null });
+  assert.deepEqual(await h.raw('test', '6:1'), { suggestion: null, retry: null });
   assert.equal(calls, 1);
   h.fire('session/event', session, end(9, 3, 'aborted'));
   assert.equal(await h.call(), null);
@@ -186,8 +187,8 @@ test('missing context never exposes a retry or calls the model', async () => {
   let calls = 0;
   const h = host(model(async function* () { calls++; }));
   h.fire('session/event', session, rows[2]);
-  assert.deepEqual(await h.raw(), { suggestion: null, retryTurn: null });
-  assert.deepEqual(await h.raw('test', '6'), { suggestion: null, retryTurn: null });
+  assert.deepEqual(await h.raw(), { suggestion: null, retry: null });
+  assert.deepEqual(await h.raw('test', '6:1'), { suggestion: null, retry: null });
   assert.equal(calls, 0);
 });
 
@@ -204,22 +205,22 @@ test('manual retry joins concurrent requests and is cached for auto, including n
       yield finish;
     }));
     h.fire('session/event', session, rows[2]);
-    assert.deepEqual(await h.raw('test', '6'), { suggestion: null, retryTurn: null });
+    assert.deepEqual(await h.raw('test', '6:1'), { suggestion: null, retry: null });
     assert.equal(calls, 0);
-    assert.deepEqual(await h.raw(), { suggestion: null, retryTurn: 6 });
-    assert.deepEqual(await h.raw('test', '06'), { suggestion: null, retryTurn: null });
-    const first = h.raw('test', '6');
+    assert.deepEqual(await h.raw(), { suggestion: null, retry: '6:1' });
+    assert.deepEqual(await h.raw('test', '06:1'), { suggestion: null, retry: null });
+    const first = h.raw('test', '6:1');
     await started.promise;
-    const second = h.raw('test', '6');
+    const second = h.raw('test', '6:1');
     const remount = h.raw();
     gate.resolve();
-    assert.deepEqual(await Promise.all([first, second, remount]), Array(3).fill({ suggestion: output, retryTurn: null }));
-    assert.deepEqual(await h.raw('test', '6'), { suggestion: output, retryTurn: null });
+    assert.deepEqual(await Promise.all([first, second, remount]), Array(3).fill({ suggestion: output, retry: null }));
+    assert.deepEqual(await h.raw('test', '6:1'), { suggestion: output, retry: null });
     assert.equal(calls, 2);
   }
 });
 
-test('pending auto blocks manual; timeout leaves one manual attempt', { timeout: 2000 }, async t => {
+test('pending auto blocks manual; timeout leaves the retry available', { timeout: 2000 }, async t => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const { session, rows } = fixture();
   const started = Promise.withResolvers();
@@ -234,12 +235,12 @@ test('pending auto blocks manual; timeout leaves one manual attempt', { timeout:
   h.fire('session/event', session, rows[2]);
   const auto = h.raw();
   const signal = await started.promise;
-  assert.deepEqual(await h.raw('test', '6'), { suggestion: null, retryTurn: null });
+  assert.deepEqual(await h.raw('test', '6:1'), { suggestion: null, retry: null });
   assert.equal(calls, 1);
   t.mock.timers.tick(12000);
   assert.equal(signal.aborted, true);
-  assert.deepEqual(await auto, { suggestion: null, retryTurn: 6 });
-  assert.deepEqual(await h.raw('test', '6'), { suggestion: 'Ручной результат', retryTurn: null });
+  assert.deepEqual(await auto, { suggestion: null, retry: '6:1', reason: 'timeout' });
+  assert.deepEqual(await h.raw('test', '6:1'), { suggestion: 'Ручной результат', retry: null });
   assert.equal(calls, 2);
   gate.resolve();
 });
@@ -258,15 +259,15 @@ test('manual pending is cancelled and never published on turn start, inbox, or d
     }));
     h.fire('session/event', session, rows[2]);
     await h.raw();
-    const pending = h.raw('test', '6');
+    const pending = h.raw('test', '6:1');
     const signal = await started.promise;
     if (clear === 'turn') h.fire('session/event', session, { type: 'turn/start' });
     if (clear === 'inbox') h.fire('agent/inbox/inserted', { agent: { id: session.id }, message: { source: { kind: 'user' } } });
     if (clear === 'dispose') h.fire('session/disposed', session);
     if (clear === 'plugin') h.dispose();
     assert.equal(signal.aborted, true);
-    assert.deepEqual(await pending, { suggestion: null, retryTurn: null });
-    assert.deepEqual(await h.raw(), { suggestion: null, retryTurn: null });
+    assert.deepEqual(await pending, { suggestion: null, retry: null });
+    assert.deepEqual(await h.raw(), { suggestion: null, retry: null });
     gate.resolve();
   }
 });
@@ -286,12 +287,49 @@ test('a sent user message retires the completed turn’s cached suggestion befor
   assert.equal(calls, 1);
 });
 
-test('provider failure stays optional and does not retry the same turn', async () => {
+test('failures allow manual recovery, with safe reasons and no automatic repeat', async () => {
   const { session, rows } = fixture();
   let calls = 0;
-  const h = host(model(async function* () { calls++; throw new Error('private error'); }));
+  const h = host(model(async function* () {
+    calls++;
+    if (calls === 1) throw new Error('private error');
+    if (calls === 2) {
+      yield { type: 'finish', reason: { kind: 'error', failure: { status: 429, code: 'RATE_LIMIT', message: 'private error' } } };
+      return;
+    }
+    yield { type: 'text-delta', text: '{"suggestion":"Покажи пример"}' };
+    yield finish;
+  }));
   h.fire('session/event', session, rows[2]);
-  assert.equal(await h.call(), null);
-  assert.equal(await h.call(), null);
+  const auto = { suggestion: null, retry: '6:1', reason: 'modelError' };
+  assert.deepEqual(await h.raw(), auto);
+  assert.deepEqual(await h.raw(), auto);
   assert.equal(calls, 1);
+  const limited = { suggestion: null, retry: '6:2', reason: 'rateLimited' };
+  assert.deepEqual(await h.raw('test', '6:1'), limited);
+  assert.deepEqual(await h.raw('test', '6:1'), limited);
+  assert.deepEqual(await h.raw(), limited);
+  assert.equal(calls, 2);
+  assert.deepEqual(await h.raw('test', '6:2'), { suggestion: 'Покажи пример', retry: null });
+  assert.deepEqual(await h.raw('test', '6:3'), { suggestion: null, retry: null });
+  assert.equal(calls, 3);
+});
+
+test('invalid output has a retryable reason and attempts are capped per reply', async () => {
+  const { session, rows } = fixture();
+  let calls = 0;
+  const h = host(model(async function* () {
+    calls++;
+    yield { type: 'text-delta', text: 'invalid' };
+    yield finish;
+  }));
+  h.fire('session/event', session, rows[2]);
+  assert.deepEqual(await h.raw(), { suggestion: null, retry: '6:1', reason: 'invalidResponse' });
+  assert.deepEqual(await h.raw('test', '6:1'), { suggestion: null, retry: '6:2', reason: 'invalidResponse' });
+  assert.deepEqual(await h.raw('test', '6:2'), { suggestion: null, retry: '6:3', reason: 'invalidResponse' });
+  const expired = { suggestion: null, retry: null, reason: 'invalidResponse' };
+  assert.deepEqual(await h.raw('test', '6:3'), expired);
+  assert.deepEqual(await h.raw('test', '6:3'), expired);
+  assert.deepEqual(await h.raw('test', '6:4'), { suggestion: null, retry: null });
+  assert.equal(calls, 4);
 });

@@ -1,0 +1,27 @@
+{
+  "name": "@wordpost/dsh-composer-predictions",
+  "version": "1.0.0-beta.1",
+  "private": true,
+  "description": "Next-message suggestions and context-aware draft editing for DeepSeek Harness.",
+  "license": "MIT",
+  "type": "module",
+  "repository": { "type": "git", "url": "git+https://github.com/Wordpost/dsh-composer-predictions.git" },
+  "homepage": "https://github.com/Wordpost/dsh-composer-predictions",
+  "bugs": "https://github.com/Wordpost/dsh-composer-predictions/issues",
+  "engines": { "dsh": "0.2.2-rc.5" },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": ["index.js", "prediction.js", "client.js", "cordis.patch.yml", "locale/*.json", "icon.svg", "README.md", "README.ru.md", "LICENSE"],
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": ["@deepseek-ai/dsh-client-ui-conversation", "@deepseek-ai/dsh-client-shortcuts"]
+    }
+  }
+}

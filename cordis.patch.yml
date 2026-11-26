@@ -1,0 +1,3 @@
+- insert:
+    - id: local-composer-predictions
+      name: '@wordpost/dsh-composer-predictions'

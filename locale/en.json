@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Composer predictions",
+    "description": "Suggests a next message and improves drafts with a preview. Never sends messages; extra calls use your configured model and may incur token costs."
+  }
+}

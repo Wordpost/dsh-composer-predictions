@@ -1,0 +1,57 @@
+{
+  "format": 1,
+  "title": {
+    "en": "Wordpost plugins",
+    "ru": "Плагины Wordpost",
+    "zh": "Wordpost 插件"
+  },
+  "plugins": [
+    {
+      "name": "@wordpost/dsh-composer-predictions",
+      "author": "Wordpost",
+      "title": {
+        "en": "Composer predictions",
+        "ru": "Подсказки для поля ввода",
+        "zh": "输入框消息建议"
+      },
+      "description": {
+        "en": "Suggests a next message and improves drafts with a preview. Never sends messages; extra calls use your configured model and may incur token costs.",
+        "ru": "Предлагает следующее сообщение и улучшает черновики с предпросмотром. Не отправляет сообщения. Дополнительные запросы используют вашу модель и могут расходовать токены.",
+        "zh": "建议下一条消息，并在确认前预览润色后的草稿。不会发送消息；额外请求使用已配置的模型，可能消耗令牌。"
+      },
+      "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIzNiIgaGVpZ2h0PSIzNiIgdmlld0JveD0iMCAwIDM2IDM2IiBmaWxsPSJub25lIj4KICA8cGF0aCBkPSJNMjUgMTV2OGEzIDMgMCAwIDEtMyAzaC02bC00LjUgM3YtM0gxMWEzIDMgMCAwIDEtMy0zdi05YTMgMyAwIDAgMSAzLTNoOSIgc3Ryb2tlPSJ1cmwoI2RyYWZ0LWJsdWUpIiBzdHJva2Utd2lkdGg9IjIuMjUiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPgogIDxwYXRoIGQ9Ik0xMiAxN2g1bS01IDRoOSIgc3Ryb2tlPSIjNTY4RkUzIiBzdHJva2Utd2lkdGg9IjEuNzUiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgogIDxwYXRoIGQ9Ik0yNS41IDZhLjQ1LjQ1IDAgMCAxIC40My4zMmwuOTggMi43NyAyLjc3Ljk4YS40NS40NSAwIDAgMSAwIC44NmwtMi43Ny45OC0uOTggMi43N2EuNDUuNDUgMCAwIDEtLjg2IDBsLS45OC0yLjc3LTIuNzctLjk4YS40NS40NSAwIDAgMSAwLS44NmwyLjc3LS45OC45OC0yLjc3QS40NS40NSAwIDAgMSAyNS41IDZaIiBmaWxsPSIjODc2OUQ4Ii8+CiAgPGRlZnM+CiAgICA8bGluZWFyR3JhZGllbnQgaWQ9ImRyYWZ0LWJsdWUiIHgxPSI4IiB5MT0iMTEiIHgyPSIyMyIgeTI9IjI3IiBncmFkaWVudFVuaXRzPSJ1c2VyU3BhY2VPblVzZSI+CiAgICAgIDxzdG9wIHN0b3AtY29sb3I9IiM2NkFERUUiLz48c3RvcCBvZmZzZXQ9IjEiIHN0b3AtY29sb3I9IiM0OTczRDEiLz4KICAgIDwvbGluZWFyR3JhZGllbnQ+CiAgPC9kZWZzPgo8L3N2Zz4K",
+      "homepage": "https://github.com/Wordpost/dsh-composer-predictions",
+      "repository": {
+        "url": "https://github.com/Wordpost/dsh-composer-predictions"
+      },
+      "metadata": {
+        "keywords": [
+          "composer predictions",
+          "next message",
+          "prompt rewrite",
+          "draft",
+          "подсказка",
+          "улучшение черновика",
+          "палочка",
+          "草稿",
+          "润色",
+          "下一条消息"
+        ]
+      },
+      "versions": [
+        {
+          "version": "1.0.0-beta.1",
+          "publishTimestamp": 1795667124,
+          "engines": {
+            "dsh": "0.2.2-rc.5"
+          },
+          "source": {
+            "type": "git",
+            "url": "https://github.com/Wordpost/dsh-composer-predictions",
+            "commit": "a5d61ae48795ac222c701fcf9b50ca8e94388b8e"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -16,22 +16,44 @@ const fixture = () => {
   return { rows, session: { id: 'test', header: {}, firstLiveSeq: 0, surface: { nodes: [1, 4] }, eventAt: seq => rows.find(x => x.seq === seq), isOwnSeq: () => true } };
 };
 
-function host(llm) {
+function host(llm, { observe } = {}) {
   const handlers = new Map();
+  const sessions = new Map();
+  const inboxes = new Map();
   let route;
   let dispose;
-  apply({ llm, on: (event, listener) => handlers.set(event, listener), effect: register => { dispose = register(); },
+  apply({ llm, sessions, agents: {
+    get: id => inboxes.get(id),
+    turnBoundaryOf: session => ({ openTurnStartSeq: session.openTurnStartSeq ?? null }),
+  }, sessionQuery: { observeSession: observe ?? (async () => { throw { code: 'SESSION_QUERY_SESSION_NOT_FOUND' }; }) },
+    on: (event, listener) => handlers.set(event, listener), effect: register => { dispose = register(); },
     connection: { fetch: { register: value => { route = value; } } } });
-  const raw = async (id = 'test', retry, availability = false) => {
-    const params = new URLSearchParams({ session: id });
-    if (retry !== undefined) params.set('retry', retry);
-    if (availability) params.set('availability', '1');
-    const response = await route.fetch(new Request(`http://localhost${route.path}?${params}`, { method: 'POST' }));
+  const rawUrl = async (params, expectedStatus = 200, signal) => {
+    const response = await route.fetch(new Request(`http://localhost${route.path}?${params}`, { method: 'POST', signal }));
     assert.equal(response.headers.get('cache-control'), 'no-store');
+    assert.equal(response.status, expectedStatus);
     return response.json();
   };
+  const raw = async (id = 'test', retry, availability = false, expectedStatus = 200, signal) => {
+    const params = new URLSearchParams({ session: id, mode: availability ? 'availability' : retry !== undefined ? 'manual' : 'auto' });
+    if (retry !== undefined) params.set('retry', retry);
+    return rawUrl(params, expectedStatus, signal);
+  };
   const call = async (id = 'test') => (await raw(id)).suggestion;
-  return { call, raw, dispose: () => dispose(), fire: (event, ...args) => handlers.get(event)(...args) };
+  return { call, raw, rawUrl, sessions, inboxes, dispose: () => dispose(), fire(event, ...args) {
+    if (event === 'session/event') {
+      const [session, item] = args;
+      sessions.set(session.id, session);
+      if (item.type === 'turn/start') session.openTurnStartSeq = item.seq ?? 0;
+      if (item.type === 'turn/end') session.openTurnStartSeq = null;
+    }
+    if (event === 'session/disposed') sessions.delete(args[0].id);
+    if (event === 'agent/inbox/inserted') {
+      const { agent, message } = args[0];
+      inboxes.set(agent.id, { session: sessions.get(agent.id), inbox: { nextTurn: [message], nextStep: [] } });
+    }
+    handlers.get(event)(...args);
+  } };
 }
 
 function model(generate) {
@@ -54,6 +76,13 @@ test('local bundle exports, localized metadata and vector asset exist', async ()
     const { meta } = JSON.parse(await readFile(fromHere(`locale/${locale}.json`), 'utf8'));
     assert.ok(meta.title && meta.description);
   }
+});
+
+test('prediction URL requires an explicit compatible mode and retry', async () => {
+  const h = host(model(async function* () { assert.fail('unexpected generation'); }));
+  for (const query of ['session=test', 'session=test&mode=other', 'session=test&mode=manual',
+    'session=test&mode=auto&retry=6%3A0', 'session=test&mode=availability&retry=6%3A0',
+    'session=test&mode=manual&retry=bad']) await h.rawUrl(query, 400);
 });
 
 test('uses recent visible human and assistant text only, after a final answer of that turn', () => {
@@ -175,7 +204,7 @@ test('explicit cutoff claims are suppressed, without blocking ordinary follow-up
   }
 });
 
-test('a hallucinated cutoff is suppressed without offering another attempt', async () => {
+test('a hallucinated cutoff stays hidden in both automatic and manual suggestions', async () => {
   const { session, rows } = fixture();
   let calls = 0;
   const h = host(model(async function* () {
@@ -184,9 +213,9 @@ test('a hallucinated cutoff is suppressed without offering another attempt', asy
     yield finish;
   }));
   h.fire('session/event', session, rows[2]);
-  assert.deepEqual(await h.raw(), { suggestion: null, retry: null });
+  assert.deepEqual(await h.raw(), { suggestion: null, retry: '6:1' });
   assert.deepEqual(await h.raw('test', '6:1'), { suggestion: null, retry: null });
-  assert.equal(calls, 1);
+  assert.equal(calls, 2);
 });
 
 test('a newer turn aborts and releases waiters before an unresponsive provider settles', { timeout: 2000 }, async () => {
@@ -259,7 +288,7 @@ test('missing context never exposes a retry or calls the model', async () => {
   assert.equal(calls, 0);
 });
 
-test('an intentional skip is quiet and cannot start a retry', async () => {
+test('an automatic skip offers one explicit try without automatically retrying', async () => {
   const { session, rows } = fixture();
   let calls = 0;
   const h = host(model(async function* () {
@@ -268,15 +297,127 @@ test('an intentional skip is quiet and cannot start a retry', async () => {
     yield finish;
   }));
   h.fire('session/event', session, rows[2]);
+  const available = { suggestion: null, retry: '6:1' };
+  assert.deepEqual(await h.raw(), available);
+  assert.deepEqual(await h.raw('test', undefined, true), available);
+  assert.deepEqual(await h.raw(), available);
+  assert.equal(calls, 1);
   const skipped = { suggestion: null, retry: null };
-  assert.deepEqual(await h.raw(), skipped);
   assert.deepEqual(await h.raw('test', '6:1'), skipped);
-  assert.deepEqual(await h.raw('test', undefined, true), skipped);
+  assert.deepEqual(await h.raw('test', '6:2'), skipped);
   assert.deepEqual(await h.raw(), skipped);
+  assert.equal(calls, 2);
+});
+
+test('restored, persisted and expired turns offer the star without automatic generation', async () => {
+  for (const source of ['restored', 'persisted', 'expired']) {
+    const { session, rows } = fixture();
+    const events = [];
+    for (const row of rows) events[row.seq] = row;
+    session.seq = 7;
+    if (source === 'restored') session.firstLiveSeq = 7;
+    if (source === 'expired') rows[2].time -= 24 * 60 * 60 * 1000;
+    let reads = 0;
+    let releases = 0;
+    let calls = 0;
+    const h = host(model(async function* () {
+      calls++;
+      yield { type: 'text-delta', text: '{"suggestion":"Разбери второй вариант"}' };
+      yield finish;
+    }), { observe: async (_id, { projectionMode }) => {
+      assert.equal(projectionMode, 'none');
+      reads++;
+      return { source: source === 'persisted' ? 'prepared' : 'live', header: session.header, cursor: 6, events,
+        [Symbol.dispose]: () => releases++ };
+    } });
+    if (source !== 'persisted') h.fire('session/event', session, rows[2]);
+    const [ready, available] = await Promise.all([h.raw(), h.raw('test', undefined, true)]);
+    assert.equal(ready.suggestion, null);
+    assert.match(ready.retry, source === 'expired' ? /^6:0$/u : /^6:0:[a-f0-9]{32}$/u);
+    assert.deepEqual(available, ready);
+    assert.equal(calls, 0);
+    const suggested = { suggestion: 'Разбери второй вариант', retry: null, turn: 6 };
+    assert.deepEqual(await Promise.all([h.raw('test', ready.retry), h.raw('test', ready.retry)]), [suggested, suggested]);
+    assert.deepEqual(await h.raw(), { ...ready, turn: 6 }); // A revisit does not automatically reveal the cached ghost.
+    assert.equal(calls, 1);
+    assert.equal(reads, source === 'expired' ? 0 : source === 'persisted' ? 3 : 1);
+    assert.equal(releases, reads);
+  }
+});
+
+test('historical lookup never falls back past an interrupted or open turn or a newer human message', async () => {
+  for (const newer of [end(7, 3, 'aborted'), { seq: 7, type: 'turn/start' }, message(7, 'user', [text('Новый запрос')])]) {
+    const { session, rows } = fixture();
+    const events = [];
+    for (const row of [...rows, newer]) events[row.seq] = row;
+    const h = host(model(async function* () { assert.fail('unexpected generation'); }), {
+      observe: async () => ({ source: 'prepared', events, header: session.header, [Symbol.dispose]() {} }),
+    });
+    assert.deepEqual(await h.raw(), { suggestion: null, retry: null });
+    assert.deepEqual(await h.raw('test', '6:0', false, 409), { suggestion: null, retry: null });
+  }
+});
+
+test('an evicted historical retry refreshes availability without replaying the model call', async () => {
+  const { session, rows } = fixture();
+  const events = [];
+  for (const row of rows) events[row.seq] = row;
+  let calls = 0;
+  const h = host(model(async function* () { calls++; throw new Error('provider unavailable'); }), {
+    observe: async id => ({ source: 'prepared', events, revision: 'rev1', header: { ...session.header, id }, [Symbol.dispose]() {} }),
+  });
+  const firstKey = (await h.raw()).retry;
+  const failed = await h.raw('test', firstKey);
+  assert.equal(failed.reason, 'modelError');
+  assert.equal(failed.retry, firstKey.replace(/^6:0:/u, '6:1:'));
+  for (let i = 0; i < 32; i++) await h.raw(`older-${i}`);
+  for (const key of [firstKey, failed.retry]) {
+    assert.deepEqual(await h.raw('test', key, false, 409), { suggestion: null, retry: null });
+  }
+  const refreshed = await h.raw('test', undefined, true);
+  assert.match(refreshed.retry, /^6:0:[a-f0-9]{32}$/u);
+  assert.notEqual(refreshed.retry, firstKey);
+  assert.deepEqual(await h.raw('test', firstKey, false, 409), { suggestion: null, retry: null });
   assert.equal(calls, 1);
 });
 
-test('a replayed turn does not make a prediction eligible', async () => {
+test('a click for old persisted history cannot act on a changed source revision', async () => {
+  const { session, rows } = fixture();
+  const events = [];
+  for (const row of rows) events[row.seq] = row;
+  let revision = 'original';
+  const h = host(model(async function* () { assert.fail('unexpected generation'); }), {
+    observe: async () => ({ source: 'prepared', events, revision, header: session.header, [Symbol.dispose]() {} }),
+  });
+  const first = await h.raw();
+  assert.match(first.retry, /^6:0:[a-f0-9]{32}$/u);
+  revision = 'replaced';
+  assert.deepEqual(await h.raw('test', first.retry, false, 409), { suggestion: null, retry: null });
+  const refreshed = await h.raw();
+  assert.match(refreshed.retry, /^6:0:[a-f0-9]{32}$/u);
+  assert.notEqual(refreshed.retry, first.retry);
+  assert.deepEqual(await h.raw('test', first.retry, false, 409), { suggestion: null, retry: null });
+});
+
+test('a stale historical read cannot publish a retry after a newer turn starts', async () => {
+  const { session, rows } = fixture();
+  const events = [];
+  for (const row of rows) events[row.seq] = row;
+  const pending = Promise.withResolvers();
+  let signal;
+  let released = false;
+  const h = host(model(async function* () { assert.fail('unexpected generation'); }), {
+    observe: async (_id, options) => { signal = options.signal; return pending.promise; },
+  });
+  const request = h.raw();
+  h.fire('session/event', session, { type: 'turn/start', seq: 7 });
+  assert.equal(signal.aborted, true);
+  pending.resolve({ source: 'prepared', events, header: session.header, [Symbol.dispose]: () => { released = true; } });
+  assert.deepEqual(await request, { suggestion: null, retry: null });
+  assert.equal(released, true);
+});
+
+test('replay does not start a live automatic attempt', async () => {
   const { session, rows } = fixture();
   session.firstLiveSeq = rows[2].seq + 1;
   let calls = 0;
@@ -316,6 +457,102 @@ test('manual retry joins concurrent requests and is cached for auto, including n
   }
 });
 
+test('transport recovery probes availability before a lost automatic request and consumes one manual null', async () => {
+  const { session, rows } = fixture();
+  const gate = Promise.withResolvers();
+  const started = Promise.withResolvers();
+  let calls = 0;
+  const h = host(model(async function* () {
+    calls++;
+    started.resolve();
+    await gate.promise;
+    yield { type: 'text-delta', text: '{"suggestion":null}' };
+    yield finish;
+  }));
+  h.fire('session/event', session, rows[2]);
+  const available = await h.raw('test', undefined, true);
+  assert.deepEqual(available, { suggestion: null, retry: '6:0' });
+  assert.equal(calls, 0);
+  const first = h.raw('test', available.retry);
+  await started.promise;
+  const second = h.raw('test', available.retry);
+  gate.resolve();
+  assert.deepEqual(await Promise.all([first, second]), Array(2).fill({ suggestion: null, retry: null }));
+  assert.equal(calls, 1);
+  assert.deepEqual(await h.raw('test', available.retry), { suggestion: null, retry: null });
+});
+
+test('shared historical observation aborts only when its last request leaves and cannot publish late', { timeout: 2000 }, async () => {
+  const { session, rows } = fixture();
+  const events = [];
+  for (const row of rows) events[row.seq] = row;
+  const started = Promise.withResolvers();
+  const pending = Promise.withResolvers();
+  let reads = 0;
+  let releases = 0;
+  let observedSignal;
+  const h = host(model(async function* () { assert.fail('unexpected generation'); }), {
+    observe: async (_id, { signal }) => {
+      reads++;
+      if (reads === 1) { observedSignal = signal; started.resolve(); return pending.promise; }
+      return { source: 'prepared', revision: 'old', events: [], header: session.header, [Symbol.dispose]() { releases++; } };
+    },
+  });
+  const a = new AbortController();
+  const b = new AbortController();
+  const first = h.raw('test', undefined, true, 200, a.signal);
+  await started.promise;
+  const second = h.raw('test', undefined, true, 200, b.signal);
+  a.abort();
+  assert.deepEqual(await first, { suggestion: null, retry: null });
+  assert.equal(observedSignal.aborted, false);
+  b.abort();
+  assert.equal(observedSignal.aborted, true);
+  assert.deepEqual(await second, { suggestion: null, retry: null });
+  pending.resolve({ source: 'prepared', revision: 'old', events, header: session.header, [Symbol.dispose]() { releases++; } });
+  await new Promise(resolve => setImmediate(resolve));
+  const available = await h.raw('test', undefined, true);
+  assert.deepEqual(available, { suggestion: null, retry: null });
+  assert.equal(reads, 2);
+  assert.equal(releases, 2);
+});
+
+test('settling 34 active detached manual attempts prunes without cancelling active calls', { timeout: 5000 }, async () => {
+  const { session, rows } = fixture();
+  const events = [];
+  for (const row of rows) events[row.seq] = row;
+  const gate = Promise.withResolvers();
+  const allStarted = Promise.withResolvers();
+  const signals = [];
+  const h = host(model(async function* (_options, signal) {
+    signals.push(signal);
+    if (signals.length === 34) allStarted.resolve();
+    await gate.promise;
+    yield { type: 'text-delta', text: '{"suggestion":null}' };
+    yield finish;
+  }), { observe: async () => ({ source: 'prepared', revision: 'stable', events, header: session.header, [Symbol.dispose]() {} }) });
+  const keys = [];
+  const requests = [];
+  try {
+    for (let i = 0; i < 34; i++) {
+      const id = `detached-${i}`;
+      const available = await h.raw(id, undefined, true);
+      keys.push(available.retry);
+      requests.push(h.raw(id, available.retry));
+    }
+    await allStarted.promise;
+    assert.ok(signals.every(signal => !signal.aborted));
+    gate.resolve();
+    assert.deepEqual(await Promise.all(requests), Array(34).fill({ suggestion: null, retry: null }));
+    assert.ok(signals.every(signal => !signal.aborted));
+    assert.deepEqual(await h.raw('detached-0', keys[0], false, 409), { suggestion: null, retry: null });
+    const refreshed = await h.raw('detached-0', undefined, true);
+    assert.match(refreshed.retry, /^6:0:[a-f0-9]{32}$/u);
+    assert.notEqual(refreshed.retry, keys[0]);
+    assert.equal(signals.length, 34);
+  } finally { gate.resolve(); }
+});
+
 test('manual-only availability never spends tokens and a click shares the same attempt', async () => {
   const { session, rows } = fixture();
   let calls = 0;
@@ -332,7 +569,7 @@ test('manual-only availability never spends tokens and a click shares the same a
   const available = { suggestion: null, retry: '6:0' };
   assert.deepEqual(await h.raw('test', undefined, true), available);
   assert.deepEqual(await h.raw('test', undefined, true), available);
-  assert.deepEqual(await h.raw('test', '6:0', true), { suggestion: null, retry: null });
+  await h.raw('test', '6:0', true, 400);
   assert.equal(calls, 0);
   const first = h.raw('test', '6:0');
   await started.promise;

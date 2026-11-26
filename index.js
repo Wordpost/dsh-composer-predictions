@@ -1,11 +1,12 @@
-import { generatePrediction, readContext, generateRewrite, readRewriteContext } from './prediction.js';
+import { generatePrediction, readContext, readHistoricalContext, generateRewrite, readRewriteContext } from './prediction.js';
 
-export const inject = ['connection', 'llm', 'sessions', 'agents'];
+export const inject = ['connection', 'llm', 'sessions', 'agents', 'sessionQuery'];
 const ROUTE = '/api/local-composer-predictions/next';
 const PREDICTION_DEADLINE_MS = 30000;
 const REWRITE_DEADLINE_MS = 12000;
 const FRESHNESS_MS = 15 * 60 * 1000;
-const MAX_ATTEMPTS = 4; // One automatic attempt and up to three manual attempts after errors.
+const MAX_MANUAL_ATTEMPTS = 3;
+const MAX_DETACHED_ENTRIES = 32;
 
 function generateWithinDeadline(controller, deadlineMs, generate) {
   const { signal } = controller;
@@ -28,9 +29,77 @@ function generateWithinDeadline(controller, deadlineMs, generate) {
 export function apply(ctx) {
   const latest = new Map();
   const rewrites = new Map();
+  const historyChecks = new Map();
   let disposed = false;
 
+  function trimDetachedCache() {
+    const settled = [...latest].filter(([, entry]) => !entry.session && !entry.active && !entry.attempt?.waiters);
+    for (let i = 0; i < settled.length - MAX_DETACHED_ENTRIES; i++) clear(settled[i][0]);
+  }
+
+  // Keep in-flight history reads invalidatable even before they find a source.
+  function startHistoryCheck(id, session) {
+    const check = { session, controller: new AbortController(), waiters: 0 };
+    const { signal } = check.controller;
+    check.pending = (async () => {
+      const observation = await ctx.sessionQuery.observeSession(id, { projectionMode: 'none', signal });
+      try {
+        if (signal.aborted || ctx.sessions.get(id) !== session || observation.header.origin === 'subagent'
+          || (observation.source === 'live' && observation.cursor !== session?.seq - 1)) return undefined;
+        const cached = latest.get(id);
+        if (!session && cached?.historical && cached.revision === observation.revision) return cached;
+        const history = readHistoricalContext(observation.events);
+        if (cached && !session) {
+          latest.delete(id);
+          cached.active?.abort();
+        }
+        if (!history) return undefined;
+        const entry = { ...history, session, historical: true, revision: observation.revision,
+          keySuffix: `:${crypto.randomUUID().replaceAll('-', '')}` };
+        latest.set(id, entry);
+        if (!session) trimDetachedCache();
+        return entry;
+      } finally {
+        observation[Symbol.dispose]();
+      }
+    })().finally(() => { if (historyChecks.get(id) === check) historyChecks.delete(id); });
+    historyChecks.set(id, check);
+    return check;
+  }
+
+  function cancelHistoryCheck(id, check) {
+    if (historyChecks.get(id) === check) historyChecks.delete(id);
+    check.controller.abort();
+  }
+
+  async function historicalEntry(id, session, signal) {
+    if (signal.aborted) return undefined;
+    const previous = historyChecks.get(id);
+    if (previous && previous.session !== session) cancelHistoryCheck(id, previous);
+    const check = historyChecks.get(id) ?? startHistoryCheck(id, session);
+    const { promise: cancelled, resolve } = Promise.withResolvers();
+    const lifetime = AbortSignal.any([signal, check.controller.signal]);
+    check.waiters++;
+    let waiting = true;
+    const release = () => {
+      if (!waiting) return;
+      waiting = false;
+      lifetime.removeEventListener('abort', onAbort);
+      if (--check.waiters === 0 && historyChecks.get(id) === check) cancelHistoryCheck(id, check);
+    };
+    const onAbort = () => { release(); resolve(undefined); };
+    lifetime.addEventListener('abort', onAbort, { once: true });
+    if (lifetime.aborted) onAbort();
+    try {
+      return await Promise.race([cancelled, check.pending]);
+    } finally {
+      release();
+    }
+  }
+
   function clear(id) {
+    const check = historyChecks.get(id);
+    if (check) cancelHistoryCheck(id, check);
     const entry = latest.get(id);
     if (entry === undefined) return;
     latest.delete(id);
@@ -51,9 +120,11 @@ export function apply(ctx) {
     clear(agent.id);
     rewrites.get(agent.id)?.abort();
   });
+  ctx.on('session/created', session => clear(session.id));
   ctx.on('session/disposed', (session) => { clear(session.id); rewrites.get(session.id)?.abort(); });
   ctx.effect(() => () => {
     disposed = true;
+    for (const id of historyChecks.keys()) clear(id);
     for (const id of latest.keys()) clear(id);
     for (const controller of rewrites.values()) controller.abort();
   });
@@ -101,25 +172,53 @@ export function apply(ctx) {
     async fetch(request) {
       const params = new URL(request.url).searchParams;
       const id = params.get('session');
-      const response = ({ suggestion = null, reason } = {}, retry = null, turn) => Response.json({
+      const response = ({ suggestion = null, reason } = {}, retry = null, turn, status = 200) => Response.json({
         suggestion, retry, ...(reason === undefined ? {} : { reason }), ...(turn === undefined ? {} : { turn }),
-      }, {
-        headers: { 'cache-control': 'no-store' },
-      });
-      const entry = latest.get(id);
-      if (entry === undefined || request.signal.aborted) return response();
-      if (Date.now() - entry.event.time > FRESHNESS_MS) {
-        clear(id);
-        return response();
+      }, { status, headers: { 'cache-control': 'no-store' } });
+      const mode = params.get('mode');
+      const retry = params.get('retry');
+      if (!['auto', 'availability', 'manual'].includes(mode)
+        || (mode === 'manual' ? !/^\d+:\d+(?::[a-f0-9]{32})?$/u.test(retry ?? '') : retry !== null)) {
+        return response(undefined, null, undefined, 400);
       }
-      const retryKey = attempt => `${entry.event.seq}:${attempt}`;
+      if (!id || disposed || request.signal.aborted) return response();
+      const session = ctx.sessions.get(id);
+      const agent = ctx.agents.get(id);
+      if (session && (session.header.origin === 'subagent'
+        || ctx.agents.turnBoundaryOf(session).openTurnStartSeq !== null
+        || (agent?.session === session && (agent.inbox.nextTurn.length > 0 || agent.inbox.nextStep.length > 0)))) return response();
+
+      let entry = latest.get(id);
+      if (entry && entry.session !== session) {
+        clear(id);
+        entry = undefined;
+      }
+      if (!entry || !session) {
+        // Revalidate detached sessions against the stored revision. An expired
+        // key can refresh availability, but cannot replay or start a model call.
+        const offered = entry;
+        if (retry !== null && !offered) return response(undefined, null, undefined, 409);
+        try {
+          entry = await historicalEntry(id, session, request.signal);
+          if (retry !== null && entry !== offered) return response(undefined, null, undefined, 409);
+        } catch (error) {
+          if (request.signal.aborted || disposed || error?.code === 'SESSION_QUERY_ABORTED'
+            || error?.code === 'SESSION_QUERY_SESSION_NOT_FOUND') return response();
+          return response(undefined, null, undefined, 503);
+        }
+      }
+      if (!entry || latest.get(id) !== entry || request.signal.aborted) return response();
+      const manualAvailability = mode === 'availability' || (mode === 'auto'
+        && (entry.historical || Date.now() - entry.event.time > FRESHNESS_MS));
+      const retryKey = attempt => `${entry.event.seq}:${attempt}${entry.keySuffix ?? ''}`;
+      if (retry !== null && entry.keySuffix && !retry.endsWith(entry.keySuffix)) return response(undefined, null, undefined, 409);
       const canRetry = attempt => attempt.result && !attempt.result.suggestion
-        && attempt.number < (entry.manualOnly ? MAX_ATTEMPTS - 1 : MAX_ATTEMPTS)
-        && attempt.result.reason !== undefined;
+        && attempt.number < (entry.manualOnly ? MAX_MANUAL_ATTEMPTS : MAX_MANUAL_ATTEMPTS + 1)
+        && (attempt.result.reason !== undefined || (!entry.manualOnly && attempt.number === 1));
       const start = number => {
         const controller = new AbortController();
         entry.active = controller;
-        const attempt = { number, result: undefined, pending: undefined };
+        const attempt = { number, result: undefined, pending: undefined, waiters: 0 };
         attempt.pending = generateWithinDeadline(controller, PREDICTION_DEADLINE_MS, signal => generatePrediction(ctx.llm, entry.context, signal))
           .then(result => {
             if (entry.active === controller) entry.active = undefined;
@@ -127,18 +226,15 @@ export function apply(ctx) {
           });
         entry.attempt = attempt;
       };
-      const retry = params.get('retry');
-      const availability = params.has('availability');
-      if (availability && retry !== null) return response();
       const previous = entry.attempt;
       if (!previous) {
         if (retry !== null && retry !== retryKey(0)) return response();
         if (entry.context === undefined) entry.context = readContext(entry.session, entry.event);
         if (!entry.context) return response();
-        if (availability) return response(undefined, retryKey(0));
+        if (manualAvailability) return response(undefined, retryKey(0));
         entry.manualOnly = retry !== null;
         start(1);
-      } else if (availability) {
+      } else if (manualAvailability) {
         // A click can retrieve a cached suggestion or join an in-flight attempt.
         if (!previous.result || previous.result.suggestion) return response(undefined, retryKey(previous.number - 1), entry.event.seq);
         return response(previous.result, canRetry(previous) ? retryKey(previous.number) : null);
@@ -148,14 +244,17 @@ export function apply(ctx) {
         // Resending the same key joins or retrieves its attempt without starting another model call.
       }
       const attempt = entry.attempt;
-      const result = await attempt.pending;
-      if (latest.get(id) !== entry || request.signal.aborted) return response();
-      if (Date.now() - entry.event.time > FRESHNESS_MS) {
-        clear(id);
-        return response();
+      attempt.waiters++;
+      try {
+        const result = await attempt.pending;
+        if (latest.get(id) !== entry || request.signal.aborted || entry.attempt !== attempt) return response();
+        if (mode === 'auto' && Date.now() - entry.event.time > FRESHNESS_MS && result.suggestion) {
+          return response(undefined, retryKey(attempt.number - 1), entry.event.seq);
+        }
+        return response(result, canRetry(attempt) ? retryKey(attempt.number) : null, result.suggestion ? entry.event.seq : undefined);
+      } finally {
+        if (--attempt.waiters === 0 && !session) trimDetachedCache();
       }
-      if (entry.attempt !== attempt) return response();
-      return response(result, canRetry(attempt) ? retryKey(attempt.number) : null, result.suggestion ? entry.event.seq : undefined);
     },
   });
 }

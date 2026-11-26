@@ -43,6 +43,22 @@ function dialogueEvent(event) {
   return message.content.some(block => block.type === 'tool-call') ? null : message;
 }
 
+// Only the most recent turn can be the source: never look past an interrupted
+// turn or a newer human message to find an older completion.
+export function readHistoricalContext(events) {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    if (!event) continue;
+    if (event.type === 'turn/end') {
+      if (event.data.reason.kind !== 'completed') return null;
+      const context = readContext({ eventAt: seq => events[seq] }, event);
+      return context && { event, context };
+    }
+    if (event.type === 'turn/start' || (event.type === 'user/message' && dialogueEvent(event))) return null;
+  }
+  return null;
+}
+
 export function readContext(session, end) {
   const transcript = [];
   let route;

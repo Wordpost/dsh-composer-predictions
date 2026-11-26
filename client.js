@@ -173,7 +173,9 @@ window.__ModuleLoader__.load({
         ['modelError', 'suggestionModelError'], ['invalidResponse', 'suggestionInvalidResponse'],
       ]);
 
-      async function request(sessionId, entry, manual = false, retry = null, fromAvailability = false) {
+      const passiveMode = () => preference.snapshot() ? 'auto' : 'availability';
+
+      async function request(sessionId, entry, mode, retry = null) {
         const now = Date.now();
         for (const [id, dismissal] of dismissedTurns) {
           if (dismissal.expires > now) break;
@@ -182,19 +184,21 @@ window.__ModuleLoader__.load({
         entry.controller?.abort();
         const controller = new AbortController();
         entry.controller = controller;
-        const availability = retry === null && (fromAvailability || (!manual && !preference.snapshot()));
-        const params = new URLSearchParams({ session: sessionId });
-        if (retry !== null) params.set('retry', retry);
-        if (availability) params.set('availability', '1');
+        const params = new URLSearchParams({ session: sessionId, mode });
+        if (mode === 'manual') params.set('retry', retry);
         // Resend the same key on network failure: Host joins/retrieves the same attempt.
-        let result = { phase: 'ready', retry, availability, status: 'suggestionConnectionError' };
+        let result = { phase: 'ready', retry, status: 'suggestionConnectionError' };
         try {
           const response = await fetch(`api/local-composer-predictions/next?${params}`, {
             method: 'POST', credentials: 'same-origin', signal: controller.signal,
           });
           if (!response.ok) {
             if (response.status === 429) {
-              result = { phase: 'ready', retry, availability, status: 'suggestionRateLimited' };
+              result = { phase: 'ready', retry, status: 'suggestionRateLimited' };
+            } else if (response.status === 409 && mode === 'manual' && !controller.signal.aborted) {
+              // Refresh the button, never replay an expired offer on the same click.
+              void request(sessionId, entry, 'availability');
+              return;
             } else if (response.status >= 400 && response.status < 500) {
               result = { phase: 'finished', status: 'suggestionUnavailable' };
             }
@@ -209,22 +213,19 @@ window.__ModuleLoader__.load({
               result = { phase: 'finished' };
             } else if (typeof body?.suggestion === 'string' && body.suggestion.length > 0 && [...body.suggestion].length <= 240) {
               result = { phase: 'suggestion', text: body.suggestion, turn };
-            } else if (typeof body?.retry === 'string' && /^\d+:\d+$/u.test(body.retry)) {
-              if (manual && availability && !controller.signal.aborted) {
-                // Finish a user-initiated request after recovering a failed availability check.
-                void request(sessionId, entry, true, body.retry);
-                return;
-              }
+            } else if (typeof body?.retry === 'string' && body.retry.length > 0 && body.retry.length <= 80) {
               result = { phase: 'ready', retry: body.retry, status };
             } else if (body?.suggestion === null && body.retry === null) {
-              result = { phase: 'finished', status: status ? 'suggestionAttemptsExhausted' : manual ? 'noSuggestion' : undefined,
+              result = { phase: 'finished', status: status ? 'suggestionAttemptsExhausted' : mode === 'manual' ? 'noSuggestion' : undefined,
                 detail: status };
             }
           }
         } catch {
           // Do not surface raw transport errors or affect the composer.
         }
-        if (!controller.signal.aborted) publish(entry, result);
+        if (controller.signal.aborted) return;
+        publish(entry, result);
+        return result;
       }
 
       return {
@@ -233,7 +234,7 @@ window.__ModuleLoader__.load({
           if (!entry) {
             entry = { state: initial, listeners: new Set() };
             entries.set(sessionId, entry);
-            void request(sessionId, entry);
+            void request(sessionId, entry, passiveMode());
           }
           entry.listeners.add(listener);
           return () => {
@@ -244,12 +245,20 @@ window.__ModuleLoader__.load({
           };
         },
         snapshot: sessionId => entries.get(sessionId)?.state ?? initial,
-        retry(sessionId) {
+        async retry(sessionId) {
           const entry = entries.get(sessionId);
           if (entry?.state.phase !== 'ready') return;
-          const { retry, availability } = entry.state;
+          let { retry } = entry.state;
           publish(entry, { phase: 'manual' });
-          void request(sessionId, entry, true, retry, availability);
+          if (retry === null) {
+            // A transport failure may mean the automatic request never reached the Host.
+            // Probe without spending a model call, then use at most one returned offer.
+            const available = await request(sessionId, entry, 'availability');
+            if (entries.get(sessionId) !== entry || entry.state !== available || !available?.retry) return;
+            retry = available.retry;
+            publish(entry, { phase: 'manual' });
+          }
+          await request(sessionId, entry, 'manual', retry);
         },
         dismiss(sessionId) {
           const entry = entries.get(sessionId);
@@ -265,7 +274,7 @@ window.__ModuleLoader__.load({
           for (const [sessionId, entry] of entries) {
             if (entry.state.phase === 'manual') continue;
             publish(entry, initial);
-            void request(sessionId, entry);
+            void request(sessionId, entry, passiveMode());
           }
         },
       };

@@ -40,6 +40,18 @@
       },
       "versions": [
         {
+          "version": "1.0.0-beta.4",
+          "publishTimestamp": 1795680352,
+          "engines": {
+            "dsh": "0.2.2-rc.5"
+          },
+          "source": {
+            "type": "git",
+            "url": "https://github.com/Wordpost/dsh-composer-predictions",
+            "commit": "c3856d98803a987c8760bbbab73b573527be3742"
+          }
+        },
+        {
           "version": "1.0.0-beta.3",
           "publishTimestamp": 1795677854,
           "engines": {

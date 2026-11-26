@@ -5,11 +5,15 @@ window.__ModuleLoader__.load({
     const { createElement: h, useCallback, useEffect, useId, useLayoutEffect, useRef, useState, useSyncExternalStore } = React;
     const overlaySlot = 'conversation.input.overlay';
     const toolbarSlot = 'conversation.input.left';
+    const settingsSlot = 'settings.general.item';
+    const autoPreferenceKey = 'wordpost.composer-predictions.auto';
+    const dismissalLifetime = 15 * 60 * 1000; // At least as long as a Host suggestion can be fresh.
     const namespace = 'local-composer-predictions';
     const editableSelector = '[data-composer-input][contenteditable="true"]:not([data-composer-composing])';
     const placeholderSelector = '[data-composer-placeholder]';
-    const emptyCard = `[data-composer-card]:has(${editableSelector} + ${placeholderSelector})`;
-    const activeCard = `${emptyCard}:has(> [data-composer-overlay] .dsh-next-message)`;
+    const triggerMenu = '[data-trigger-menu], button[aria-haspopup="listbox"][aria-expanded="true"]';
+    const emptyCard = `[data-composer-card]:has(${editableSelector} + ${placeholderSelector}):not(:has(${triggerMenu}))`;
+    const activeCard = `${emptyCard}:has(${editableSelector}:focus, .dsh-next-message-accept:focus):has(> [data-composer-overlay] .dsh-next-message)`;
     const styles = `
       .dsh-next-message {
         display:none; position:absolute; z-index:1; box-sizing:border-box;
@@ -27,6 +31,10 @@ window.__ModuleLoader__.load({
         color:var(--dsw-alias-label-secondary); cursor:pointer; pointer-events:auto; }
       .dsh-next-message-accept:hover, .dsh-next-message-accept:focus-visible { color:var(--dsw-alias-label-primary); }
       .dsh-next-message-accept:focus-visible { outline:2px solid var(--dsw-alias-brand-primary); outline-offset:2px; }
+      .dsh-next-message-dismiss { display:grid; place-items:center; min-width:20px; min-height:20px; }
+      .dsh-next-message-announcement { position:absolute; width:1px; height:1px;
+        overflow:hidden; clip-path:inset(50%); white-space:nowrap; visibility:hidden; }
+      ${activeCard} > [data-composer-overlay] .dsh-next-message-announcement { visibility:visible; }
       .dsh-next-message-accept kbd { font:inherit; }
       .dsh-next-message-accept kbd + span { display:none; }
       @media (pointer:coarse) {
@@ -76,14 +84,83 @@ window.__ModuleLoader__.load({
         overflow:hidden; clip-path:inset(50%); white-space:nowrap; }
     `;
 
+    const settingsStyles = `
+      .dsh-prediction-setting { display:flex; align-items:center; gap:16px; padding:16px 0;
+        border-bottom:1px solid var(--dsw-alias-border-l2); }
+      .dsh-prediction-setting-text { flex:1; min-width:0; }
+      .dsh-prediction-setting-title { font-size:14px; line-height:22px; color:var(--dsw-alias-label-primary); }
+      .dsh-prediction-setting-desc { margin-top:4px; font-size:12px; line-height:18px;
+        color:var(--dsw-alias-label-secondary); }
+      .dsh-prediction-setting-switch { position:relative; flex:none; width:44px; height:26px; border:0;
+        padding:0; border-radius:999px; background:var(--dsw-alias-state-idle-primary); cursor:pointer; }
+      .dsh-prediction-setting-switch[aria-checked='true'] { background:var(--dsw-alias-brand-primary); }
+      .dsh-prediction-setting-switch::after { content:''; position:absolute; inset-block-start:3px;
+        inset-inline-start:3px; width:20px; height:20px; border-radius:50%; background:var(--dsw-alias-bg-layer-1); }
+      .dsh-prediction-setting-switch[aria-checked='true']::after { inset-inline-start:21px; }
+      .dsh-prediction-setting-switch:focus-visible { outline:2px solid var(--dsw-alias-brand-primary); outline-offset:2px; }
+    `;
+
+    function AutoSuggestionSetting({ t, preference }) {
+      const enabled = useSyncExternalStore(preference.subscribe, preference.snapshot);
+      const [failed, setFailed] = useState(false);
+      const label = useId();
+      const description = useId();
+      return h('div', { className: 'dsh-prediction-setting' },
+        h('style', null, settingsStyles),
+        h('div', { className: 'dsh-prediction-setting-text' },
+          h('div', { id: label, className: 'dsh-prediction-setting-title' }, t('autoSuggestions')),
+          h('div', { id: description, className: 'dsh-prediction-setting-desc' }, t('autoSuggestionsDetail')),
+          failed && h('div', { className: 'dsh-prediction-setting-desc', role: 'status' }, t('autoSuggestionsSaveError'))),
+        h('button', { type: 'button', role: 'switch', className: 'dsh-prediction-setting-switch',
+          'aria-labelledby': label, 'aria-describedby': description, 'aria-checked': enabled,
+          onClick: () => {
+            try { preference.set(!enabled); setFailed(false); } catch { setFailed(true); }
+          },
+        }));
+    }
+
     function isEmpty(input) {
       return input.phase === 'plain' && input.draft === '' && input.attachmentIds.length === 0
         && input.occurrences.length === 0;
     }
 
+    function createAutoPreference() {
+      let enabled = true;
+      let storage;
+      try {
+        storage = window.localStorage;
+        enabled = storage.getItem(autoPreferenceKey) !== 'off';
+      } catch { /* storage may be blocked */ }
+      const listeners = new Set();
+      function publish(next) {
+        if (next === enabled) return;
+        enabled = next;
+        for (const listener of listeners) listener();
+      }
+      return {
+        snapshot: () => enabled,
+        subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+        set(next) {
+          if (!storage) throw new Error('Preference storage unavailable');
+          storage.setItem(autoPreferenceKey, next ? 'on' : 'off');
+          publish(next);
+        },
+        observe() {
+          const onStorage = event => {
+            if (event.storageArea === storage && (event.key === autoPreferenceKey || event.key === null)) {
+              publish(event.newValue !== 'off');
+            }
+          };
+          window.addEventListener('storage', onStorage);
+          return () => window.removeEventListener('storage', onStorage);
+        },
+      };
+    }
+
     // Both composer slots subscribe to one request and one result per mounted session.
-    function createPredictionStore() {
+    function createPredictionStore(preference) {
       const entries = new Map();
+      const dismissedTurns = new Map();
       const initial = { phase: 'auto' };
 
       function publish(entry, state) {
@@ -96,27 +173,48 @@ window.__ModuleLoader__.load({
         ['modelError', 'suggestionModelError'], ['invalidResponse', 'suggestionInvalidResponse'],
       ]);
 
-      async function request(sessionId, entry, manual = false, retry = null) {
+      async function request(sessionId, entry, manual = false, retry = null, fromAvailability = false) {
+        const now = Date.now();
+        for (const [id, dismissal] of dismissedTurns) {
+          if (dismissal.expires > now) break;
+          dismissedTurns.delete(id);
+        }
+        entry.controller?.abort();
+        const controller = new AbortController();
+        entry.controller = controller;
+        const availability = retry === null && (fromAvailability || (!manual && !preference.snapshot()));
         const params = new URLSearchParams({ session: sessionId });
         if (retry !== null) params.set('retry', retry);
+        if (availability) params.set('availability', '1');
         // Resend the same key on network failure: Host joins/retrieves the same attempt.
-        let result = { phase: 'ready', retry, status: 'suggestionConnectionError' };
+        let result = { phase: 'ready', retry, availability, status: 'suggestionConnectionError' };
         try {
           const response = await fetch(`api/local-composer-predictions/next?${params}`, {
-            method: 'POST', credentials: 'same-origin', signal: entry.controller.signal,
+            method: 'POST', credentials: 'same-origin', signal: controller.signal,
           });
           if (!response.ok) {
             if (response.status === 429) {
-              result = { phase: 'ready', retry, status: 'suggestionRateLimited' };
+              result = { phase: 'ready', retry, availability, status: 'suggestionRateLimited' };
             } else if (response.status >= 400 && response.status < 500) {
               result = { phase: 'finished', status: 'suggestionUnavailable' };
             }
           } else {
             const body = await response.json();
             const status = errorLabels.get(body?.reason);
-            if (typeof body?.suggestion === 'string' && body.suggestion.length > 0 && body.suggestion.length <= 180) {
-              result = { phase: 'suggestion', text: body.suggestion, manual };
+            const turn = Number.isSafeInteger(body?.turn) ? body.turn : null;
+            const dismissed = dismissedTurns.get(sessionId);
+            if (controller.signal.aborted) return;
+            if (dismissed && turn !== null && dismissed.turn !== turn) dismissedTurns.delete(sessionId);
+            if (dismissed?.turn === turn) {
+              result = { phase: 'finished' };
+            } else if (typeof body?.suggestion === 'string' && body.suggestion.length > 0 && [...body.suggestion].length <= 240) {
+              result = { phase: 'suggestion', text: body.suggestion, turn };
             } else if (typeof body?.retry === 'string' && /^\d+:\d+$/u.test(body.retry)) {
+              if (manual && availability && !controller.signal.aborted) {
+                // Finish a user-initiated request after recovering a failed availability check.
+                void request(sessionId, entry, true, body.retry);
+                return;
+              }
               result = { phase: 'ready', retry: body.retry, status };
             } else if (body?.suggestion === null && body.retry === null) {
               result = { phase: 'finished', status: status ? 'suggestionAttemptsExhausted' : manual ? 'noSuggestion' : undefined,
@@ -126,14 +224,14 @@ window.__ModuleLoader__.load({
         } catch {
           // Do not surface raw transport errors or affect the composer.
         }
-        if (!entry.controller.signal.aborted) publish(entry, result);
+        if (!controller.signal.aborted) publish(entry, result);
       }
 
       return {
         subscribe(sessionId, listener) {
           let entry = entries.get(sessionId);
           if (!entry) {
-            entry = { state: initial, listeners: new Set(), controller: new AbortController() };
+            entry = { state: initial, listeners: new Set() };
             entries.set(sessionId, entry);
             void request(sessionId, entry);
           }
@@ -142,16 +240,33 @@ window.__ModuleLoader__.load({
             entry.listeners.delete(listener);
             if (entry.listeners.size > 0) return;
             entries.delete(sessionId);
-            entry.controller.abort();
+            entry.controller?.abort();
           };
         },
         snapshot: sessionId => entries.get(sessionId)?.state ?? initial,
         retry(sessionId) {
           const entry = entries.get(sessionId);
           if (entry?.state.phase !== 'ready') return;
-          const { retry } = entry.state;
+          const { retry, availability } = entry.state;
           publish(entry, { phase: 'manual' });
-          void request(sessionId, entry, true, retry);
+          void request(sessionId, entry, true, retry, availability);
+        },
+        dismiss(sessionId) {
+          const entry = entries.get(sessionId);
+          if (entry?.state.phase !== 'suggestion') return false;
+          if (entry.state.turn !== null) {
+            dismissedTurns.delete(sessionId);
+            dismissedTurns.set(sessionId, { turn: entry.state.turn, expires: Date.now() + dismissalLifetime });
+          }
+          publish(entry, { phase: 'finished' });
+          return true;
+        },
+        preferenceChanged() {
+          for (const [sessionId, entry] of entries) {
+            if (entry.state.phase === 'manual') continue;
+            publish(entry, initial);
+            void request(sessionId, entry);
+          }
         },
       };
     }
@@ -171,9 +286,11 @@ window.__ModuleLoader__.load({
       const state = usePrediction(store, sessionId);
       const candidate = state.phase === 'suggestion' ? state.text : null;
       const button = useRef(null);
+      const dismissButton = useRef(null);
       const empty = revision !== null;
       const label = t('insert');
       const action = t('action');
+      const dismissHint = t('dismissHint');
       const shortcuts = ctx.get('shortcuts');
       const current = useRef(null);
       useLayoutEffect(() => {
@@ -184,14 +301,24 @@ window.__ModuleLoader__.load({
       function accept() {
         const now = current.current;
         if (!now?.candidate || !now.empty) return false;
-        const editor = button.current?.closest('[data-composer-card]')?.querySelector(editableSelector);
-        if (!editor?.nextElementSibling?.matches(placeholderSelector)) return false;
+        const editor = button.current?.closest(activeCard)?.querySelector(editableSelector);
+        if (!editor) return false;
         // Lexical only moves the visible caret with the edit if the editor already has focus.
         if (editor.ownerDocument.activeElement !== editor) editor.focus({ preventScroll: true });
         const span = inputActions.captureInsertion();
         if (span.start !== 0 || span.end !== 0 || span.draftRev !== now.revision) return false;
         if (!inputActions.insertText(now.candidate, span)) return false;
+        store.dismiss(sessionId);
         current.current = { ...now, empty: false };
+        return true;
+      }
+
+      function dismiss() {
+        if (!current.current?.empty) return false;
+        const editor = button.current?.closest(activeCard)?.querySelector(editableSelector);
+        if (!editor || !store.dismiss(sessionId)) return false;
+        if (editor.ownerDocument.activeElement !== editor) editor.focus({ preventScroll: true });
+        current.current = null;
         return true;
       }
 
@@ -201,18 +328,26 @@ window.__ModuleLoader__.load({
         return shortcuts.observeFixedInput((event) => {
           if (event.type !== 'keydown') return;
           const { gesture, context } = event;
-          if (gesture.code !== 'Tab' || gesture.repeat || gesture.composing || gesture.defaultPrevented
-            || gesture.shift || gesture.alt || gesture.control || gesture.meta || context.modal !== null) return;
+          if ((gesture.code !== 'Tab' && gesture.code !== 'Escape') || gesture.repeat || gesture.composing
+            || gesture.defaultPrevented || gesture.shift || gesture.alt || gesture.control || gesture.meta
+            || context.modal !== null || !current.current?.empty) return;
+          const actionButton = button.current;
           const editable = context.target?.closest(editableSelector);
-          const card = button.current?.closest('[data-composer-card]');
-          if (editable && card && card === editable.closest('[data-composer-card]') && accept()) event.consume();
+          const card = actionButton?.closest(activeCard);
+          if (!card) return;
+          const inEditor = editable && card === editable.closest('[data-composer-card]');
+          if (gesture.code === 'Tab') {
+            if (inEditor && accept()) event.consume();
+          } else if ((inEditor || actionButton?.contains(context.target) || dismissButton.current?.contains(context.target))
+            && dismiss()) event.consume();
         });
-      }, [visible, shortcuts, inputActions]);
+      }, [visible, shortcuts, inputActions, store, sessionId]);
 
-      if (!visible) return null;
       return h(React.Fragment, null,
         h('style', null, styles),
-        h('div', { className: 'dsh-next-message' },
+        h('span', { className: 'dsh-next-message-announcement', role: 'status', 'aria-atomic': true },
+          visible ? `${t(shortcuts ? 'suggestionReady' : 'suggestionReadyWithoutTab')} ${candidate}` : ''),
+        visible && h('div', { className: 'dsh-next-message' },
           h('span', { className: 'dsh-next-message-text', 'aria-hidden': true }, candidate),
           h('button', {
             ref: button, type: 'button', className: 'dsh-next-message-accept',
@@ -221,7 +356,12 @@ window.__ModuleLoader__.load({
             'aria-keyshortcuts': shortcuts ? 'Tab' : undefined,
             onMouseDown: event => event.preventDefault(),
             onClick: accept,
-          }, shortcuts && h('kbd', { 'aria-hidden': true }, 'Tab'), h('span', null, action))));
+          }, shortcuts && h('kbd', { 'aria-hidden': true }, 'Tab'), h('span', null, action)),
+          h('button', { ref: dismissButton, type: 'button', className: 'dsh-next-message-accept dsh-next-message-dismiss',
+            title: shortcuts ? dismissHint : t('dismissSuggestion'), 'aria-label': t('dismissSuggestion'),
+            'aria-keyshortcuts': shortcuts ? 'Escape' : undefined,
+            onMouseDown: event => event.preventDefault(), onClick: dismiss,
+          }, h('span', { 'aria-hidden': true }, '×'))));
     }
 
     function DraftRewrite({ t, sessionId, input, inputActions }) {
@@ -355,14 +495,14 @@ window.__ModuleLoader__.load({
       const button = useRef(null);
       const empty = revision !== null;
       const ready = state.phase === 'ready';
-      const busy = state.phase === 'auto' || state.phase === 'manual';
+      const busy = state.phase === 'manual';
       const status = state.status ? t(state.status) : '';
       const detail = state.detail ? `${t(state.detail)} ${status}` : status;
       const label = t(busy ? 'generating' : ready && status ? 'retrySuggestion' : 'generate');
 
       function generate() {
         if (!empty || !ready) return;
-        const editor = button.current?.closest('[data-composer-card]')?.querySelector(editableSelector);
+        const editor = button.current?.closest(emptyCard)?.querySelector(editableSelector);
         if (!editor?.nextElementSibling?.matches(placeholderSelector)) return;
         if (editor.ownerDocument.activeElement !== editor) editor.focus({ preventScroll: true });
         store.retry(sessionId);
@@ -380,8 +520,7 @@ window.__ModuleLoader__.load({
               stroke: 'currentColor', strokeWidth: 1.25, strokeLinejoin: 'round' }))),
         h('span', { className: 'dsh-next-message-status', role: 'status',
           title: empty && detail ? detail : undefined, 'data-visible': empty && detail ? '' : undefined },
-          !empty ? '' : detail || (state.phase === 'manual' ? t('generating')
-            : state.phase === 'suggestion' && state.manual ? t('suggestionReady') : '')));
+          !empty ? '' : detail || (state.phase === 'manual' ? t('generating') : '')));
     });
 
     const idleSession = session => session.openState === 'open' && session.subagent === null
@@ -397,11 +536,17 @@ window.__ModuleLoader__.load({
     return {
       inject: ['slots', 'locale'],
       apply(ctx) {
-        const store = createPredictionStore();
+        const preference = createAutoPreference();
+        const store = createPredictionStore(preference);
+        ctx.effect(() => preference.observe());
+        ctx.effect(() => preference.subscribe(store.preferenceChanged));
         ctx.effect(() => ctx.locale.register(namespace, {
           en: { insert: 'Insert suggested message', action: 'Insert', generate: 'Suggest a next message',
-            generating: 'Generating suggestion…', noSuggestion: 'No suggestion this time', suggestionReady: 'Suggestion ready. Press Tab to insert.',
-            retrySuggestion: 'Retry suggestion', suggestionTimeout: 'The model did not respond within 12 seconds.',
+            dismissHint: 'Dismiss suggestion (Esc)', dismissSuggestion: 'Dismiss suggestion', autoSuggestions: 'Automatic next-message suggestions',
+            autoSuggestionsDetail: 'Suggest after the agent replies. When off, use the sparkle button for a suggestion; draft improvement still works. Saved in this browser or app.',
+            autoSuggestionsSaveError: 'Could not save the preference. It has not changed.',
+            generating: 'Generating suggestion…', noSuggestion: 'No suggestion this time', suggestionReady: 'Suggestion ready. Press Tab in the message box to insert.', suggestionReadyWithoutTab: 'Suggestion ready.',
+            retrySuggestion: 'Retry suggestion', suggestionTimeout: 'The model did not respond in time.',
             suggestionRateLimited: 'The provider is limiting requests. Wait before retrying.',
             suggestionModelError: 'The model request failed.', suggestionInvalidResponse: 'The model returned an unusable suggestion.',
             suggestionConnectionError: 'Could not reach the suggestion service.', suggestionUnavailable: 'Suggestions are unavailable in this chat.',
@@ -413,8 +558,11 @@ window.__ModuleLoader__.load({
             rewriteUnavailable: 'Improvement is unavailable. Check that a model is selected and the chat is idle.',
             rewriteStale: 'The draft changed. This version will not replace it.' },
           ru: { insert: 'Вставить подсказку', action: 'Вставить', generate: 'Предложить следующее сообщение',
-            generating: 'Генерирую подсказку…', noSuggestion: 'Не удалось подобрать подсказку', suggestionReady: 'Подсказка готова. Нажмите Tab для вставки.',
-            retrySuggestion: 'Повторить генерацию подсказки', suggestionTimeout: 'Модель не ответила за 12 секунд.',
+            dismissHint: 'Скрыть подсказку (Esc)', dismissSuggestion: 'Скрыть подсказку', autoSuggestions: 'Автоподсказки следующего сообщения',
+            autoSuggestionsDetail: 'Предлагать реплику после ответа агента. Если выключить, подсказку можно запросить звёздочкой; палочка для черновика останется. Сохраняется в этом браузере или приложении.',
+            autoSuggestionsSaveError: 'Не удалось сохранить настройку. Она не изменилась.',
+            generating: 'Генерирую подсказку…', noSuggestion: 'Не удалось подобрать подсказку', suggestionReady: 'Подсказка готова. Для вставки нажмите Tab в поле ввода.', suggestionReadyWithoutTab: 'Подсказка готова.',
+            retrySuggestion: 'Повторить генерацию подсказки', suggestionTimeout: 'Модель не успела ответить.',
             suggestionRateLimited: 'Провайдер ограничил запросы. Подожди и повтори.',
             suggestionModelError: 'Запрос к модели завершился с ошибкой.', suggestionInvalidResponse: 'Модель вернула неподходящий ответ.',
             suggestionConnectionError: 'Не удалось связаться со службой подсказок.', suggestionUnavailable: 'Подсказки в этом чате недоступны.',
@@ -426,8 +574,11 @@ window.__ModuleLoader__.load({
             rewriteUnavailable: 'Улучшение недоступно. Проверьте, что выбрана модель и чат не занят.',
             rewriteStale: 'Черновик изменился. Этот вариант не заменит его.' },
           zh: { insert: '插入建议消息', action: '插入', generate: '建议下一条消息',
-            generating: '正在生成建议…', noSuggestion: '本次没有可用建议', suggestionReady: '建议已就绪。按 Tab 插入。',
-            retrySuggestion: '重试生成建议', suggestionTimeout: '模型在 12 秒内未响应。',
+            dismissHint: '按 Esc 隐藏建议', dismissSuggestion: '隐藏建议', autoSuggestions: '自动建议下一条消息',
+            autoSuggestionsDetail: '在助手回复后提供建议。关闭后仍可点击星形按钮获取建议，草稿润色仍可使用。设置保存在当前浏览器或应用中。',
+            autoSuggestionsSaveError: '无法保存设置，设置未更改。',
+            generating: '正在生成建议…', noSuggestion: '本次没有可用建议', suggestionReady: '建议已就绪。在输入框中按 Tab 插入。', suggestionReadyWithoutTab: '建议已就绪。',
+            retrySuggestion: '重试生成建议', suggestionTimeout: '模型响应超时。',
             suggestionRateLimited: '模型提供方限制了请求，请稍后重试。',
             suggestionModelError: '模型请求失败。', suggestionInvalidResponse: '模型返回的建议无法使用。',
             suggestionConnectionError: '无法连接到建议服务。', suggestionUnavailable: '此对话暂不支持建议。',
@@ -463,6 +614,8 @@ window.__ModuleLoader__.load({
         }
         ctx.slots.inject(overlaySlot, () => ctx.slots.register({ name: overlaySlot, id: namespace, order: 30, locale: namespace }, PredictionSeat));
         ctx.slots.inject(toolbarSlot, () => ctx.slots.register({ name: toolbarSlot, id: namespace, locale: namespace }, ToolbarSeat));
+        ctx.slots.inject(settingsSlot, () => ctx.slots.register({ name: settingsSlot, id: namespace, order: 21, locale: namespace },
+          ({ t }) => h(AutoSuggestionSetting, { t, preference })));
       },
     };
   },

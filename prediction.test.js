@@ -13,7 +13,7 @@ const message = (seq, role, content, turn = 2) => {
 const fixture = () => {
   const rows = [message(1, 'user', [text('Объясни тесты'), { type: 'file' }]),
     message(4, 'assistant', [{ type: 'reasoning', text: 'ignore' }, text('На выбор A и B')]), end(6, 2)];
-  return { rows, session: { id: 'test', header: {}, surface: { nodes: [1, 4] }, eventAt: seq => rows.find(x => x.seq === seq), isOwnSeq: () => true } };
+  return { rows, session: { id: 'test', header: {}, firstLiveSeq: 0, surface: { nodes: [1, 4] }, eventAt: seq => rows.find(x => x.seq === seq), isOwnSeq: () => true } };
 };
 
 function host(llm) {
@@ -22,9 +22,10 @@ function host(llm) {
   let dispose;
   apply({ llm, on: (event, listener) => handlers.set(event, listener), effect: register => { dispose = register(); },
     connection: { fetch: { register: value => { route = value; } } } });
-  const raw = async (id = 'test', retry) => {
+  const raw = async (id = 'test', retry, availability = false) => {
     const params = new URLSearchParams({ session: id });
     if (retry !== undefined) params.set('retry', retry);
+    if (availability) params.set('availability', '1');
     const response = await route.fetch(new Request(`http://localhost${route.path}?${params}`, { method: 'POST' }));
     assert.equal(response.headers.get('cache-control'), 'no-store');
     return response.json();
@@ -84,6 +85,35 @@ test('long tool-heavy turns retain the human prompt even after surface compactio
   ]);
 });
 
+test('the latest request and reply reach the model whole without older excerpts', async () => {
+  const { session, rows } = fixture();
+  rows[0].data.content[0].text = `${'запрос '.repeat(200)}Не публикуй до проверки.`;
+  const middle = `${'введение '.repeat(160)}Ключевой шаг: проверить каталог. ${'подробности '.repeat(160)}`;
+  const ending = 'Готово. Хотите проверить установку?';
+  rows[1].data.message.content.push(text(middle), { type: 'reasoning', text: 'private reasoning' }, text(ending));
+  const h = host(model(async function* (options) {
+    const { transcript, turnStatus } = JSON.parse(options.messages[0].content[0].text);
+    assert.equal(turnStatus, 'completed');
+    assert.deepEqual(transcript, [
+      { role: 'user', text: rows[0].data.content[0].text },
+      { role: 'assistant', text: `На выбор A и B\n${middle}\n${ending}` },
+    ]);
+    yield { type: 'text-delta', text: '{"suggestion":"Проверь каталог."}' };
+    yield finish;
+  }));
+  h.fire('session/event', session, rows[2]);
+  assert.equal(await h.call(), 'Проверь каталог.');
+});
+
+test('older context is selected as whole messages, not clipped fragments', () => {
+  const { session, rows } = fixture();
+  rows.unshift(message(0, 'assistant', [text(`${'детали '.repeat(800)}старый фрагмент`)], 1));
+  const { transcript } = readContext(session, rows.at(-1));
+  assert.deepEqual(transcript, [
+    { role: 'user', text: 'Объясни тесты' }, { role: 'assistant', text: 'На выбор A и B' },
+  ]);
+});
+
 test('long runs with many text updates reserve one slot for the human prompt', () => {
   const rows = new Map([[0, message(0, 'user', [text('Продолжай')])]]);
   for (let seq = 1; seq <= 9; seq++) rows.set(seq, message(seq, 'assistant', [text(`Обновление ${seq}`)]));
@@ -95,11 +125,13 @@ test('long runs with many text updates reserve one slot for the human prompt', (
 
 test('rejects absent, malformed, too long, multiline and command suggestions', () => {
   for (const output of ['{', '{"suggestion":null}', '{"suggestion":"/goal test"}', '{"suggestion":"Строка\\nвторая"}',
-    '{"suggestion":"https://example.org"}', JSON.stringify({ suggestion: 'a'.repeat(181) })]) {
+    '{"suggestion":"https://example.org"}', JSON.stringify({ suggestion: 'a'.repeat(241) }), '{"suggestion":"ok","extra":true}']) {
     assert.deepEqual(parsePrediction(output), output === '{"suggestion":null}'
       ? { suggestion: null } : { reason: 'invalidResponse' });
   }
   assert.deepEqual(parsePrediction('{"suggestion":"  Покажи второй вариант.  "}'), { suggestion: 'Покажи второй вариант.' });
+  const limit = '🙂'.repeat(240);
+  assert.deepEqual(parsePrediction(JSON.stringify({ suggestion: limit })), { suggestion: limit });
 });
 
 test('settled turns generate one tool-free request and leave other sessions untouched', async () => {
@@ -109,17 +141,52 @@ test('settled turns generate one tool-free request and leave other sessions unto
     calls++;
     assert.deepEqual(options.tools, []);
     assert.equal(options.model, 'small');
-    assert.equal(options.messages[0].content[0].text.includes('ignore'), false);
+    const payload = JSON.parse(options.messages[0].content[0].text);
+    assert.equal(payload.turnStatus, 'completed');
+    assert.deepEqual(payload.transcript, [
+      { role: 'user', text: 'Объясни тесты' }, { role: 'assistant', text: 'На выбор A и B' },
+    ]);
     yield { type: 'text-delta', text: '{"suggestion":"Покажи второй вариант"}' };
     yield finish;
   }));
   h.fire('session/event', session, rows[2]);
   assert.equal(await h.call('other'), null);
   assert.deepEqual(await Promise.all([h.call(), h.call()]), ['Покажи второй вариант', 'Покажи второй вариант']);
+  h.fire('session/event', session, rows[2]);
+  assert.equal(await h.call(), 'Покажи второй вариант');
   assert.deepEqual(await h.raw('test', '6:1'), { suggestion: null, retry: null });
   assert.equal(calls, 1);
   h.fire('session/event', session, end(9, 3, 'aborted'));
   assert.equal(await h.call(), null);
+});
+
+test('explicit cutoff claims are suppressed, without blocking ordinary follow-ups', () => {
+  for (const suggestion of [
+    'Ответ оборвался, продолжи с того места и расскажи, что нам нужно подготовить.',
+    'Кажется, сообщение было обрезано. Продолжи.',
+    'Your answer was cut off. Can you finish it?',
+    '回复好像被截断了，请继续。',
+  ]) assert.deepEqual(parsePrediction(JSON.stringify({ suggestion })), { suggestion: null });
+  for (const suggestion of ['Продолжи: покажи пример.', 'Как обработать сообщение об обрыве соединения?',
+    'Как обработать ошибку, если ответ был обрезан прокси?',
+    'What happens when the response is truncated by a proxy?',
+    '代理截断回答时该怎么处理？']) {
+    assert.deepEqual(parsePrediction(JSON.stringify({ suggestion })), { suggestion });
+  }
+});
+
+test('a hallucinated cutoff is suppressed without offering another attempt', async () => {
+  const { session, rows } = fixture();
+  let calls = 0;
+  const h = host(model(async function* () {
+    calls++;
+    yield { type: 'text-delta', text: '{"suggestion":"Ответ оборвался, продолжи с того места."}' };
+    yield finish;
+  }));
+  h.fire('session/event', session, rows[2]);
+  assert.deepEqual(await h.raw(), { suggestion: null, retry: null });
+  assert.deepEqual(await h.raw('test', '6:1'), { suggestion: null, retry: null });
+  assert.equal(calls, 1);
 });
 
 test('a newer turn aborts and releases waiters before an unresponsive provider settles', { timeout: 2000 }, async () => {
@@ -167,7 +234,7 @@ test('a hung provider cannot delay the shared result past the deadline or publis
   const results = Promise.all([h.call(), h.call()]);
   try {
     const signal = await started;
-    t.mock.timers.tick(11999);
+    t.mock.timers.tick(29999);
     assert.equal(signal.aborted, false);
     t.mock.timers.tick(1);
     assert.equal(signal.aborted, true);
@@ -192,6 +259,33 @@ test('missing context never exposes a retry or calls the model', async () => {
   assert.equal(calls, 0);
 });
 
+test('an intentional skip is quiet and cannot start a retry', async () => {
+  const { session, rows } = fixture();
+  let calls = 0;
+  const h = host(model(async function* () {
+    calls++;
+    yield { type: 'text-delta', text: '{"suggestion":null}' };
+    yield finish;
+  }));
+  h.fire('session/event', session, rows[2]);
+  const skipped = { suggestion: null, retry: null };
+  assert.deepEqual(await h.raw(), skipped);
+  assert.deepEqual(await h.raw('test', '6:1'), skipped);
+  assert.deepEqual(await h.raw('test', undefined, true), skipped);
+  assert.deepEqual(await h.raw(), skipped);
+  assert.equal(calls, 1);
+});
+
+test('a replayed turn does not make a prediction eligible', async () => {
+  const { session, rows } = fixture();
+  session.firstLiveSeq = rows[2].seq + 1;
+  let calls = 0;
+  const h = host(model(async function* () { calls++; yield finish; }));
+  h.fire('session/event', session, rows[2]);
+  assert.deepEqual(await h.raw(), { suggestion: null, retry: null });
+  assert.equal(calls, 0);
+});
+
 test('manual retry joins concurrent requests and is cached for auto, including null', async () => {
   for (const output of ['Покажи другой вариант', null]) {
     const { session, rows } = fixture();
@@ -200,23 +294,82 @@ test('manual retry joins concurrent requests and is cached for auto, including n
     let calls = 0;
     const h = host(model(async function* () {
       calls++;
-      if (calls === 2) { started.resolve(); await gate.promise; }
-      yield { type: 'text-delta', text: JSON.stringify({ suggestion: calls === 1 ? null : output }) };
+      if (calls === 1) throw new Error('provider unavailable');
+      started.resolve(); await gate.promise;
+      yield { type: 'text-delta', text: JSON.stringify({ suggestion: output }) };
       yield finish;
     }));
     h.fire('session/event', session, rows[2]);
     assert.deepEqual(await h.raw('test', '6:1'), { suggestion: null, retry: null });
     assert.equal(calls, 0);
-    assert.deepEqual(await h.raw(), { suggestion: null, retry: '6:1' });
+    assert.deepEqual(await h.raw(), { suggestion: null, retry: '6:1', reason: 'modelError' });
     assert.deepEqual(await h.raw('test', '06:1'), { suggestion: null, retry: null });
     const first = h.raw('test', '6:1');
     await started.promise;
     const second = h.raw('test', '6:1');
     const remount = h.raw();
     gate.resolve();
-    assert.deepEqual(await Promise.all([first, second, remount]), Array(3).fill({ suggestion: output, retry: null }));
-    assert.deepEqual(await h.raw('test', '6:1'), { suggestion: output, retry: null });
+    const expected = output ? { suggestion: output, retry: null, turn: 6 } : { suggestion: null, retry: null };
+    assert.deepEqual(await Promise.all([first, second, remount]), Array(3).fill(expected));
+    assert.deepEqual(await h.raw('test', '6:1'), expected);
     assert.equal(calls, 2);
+  }
+});
+
+test('manual-only availability never spends tokens and a click shares the same attempt', async () => {
+  const { session, rows } = fixture();
+  let calls = 0;
+  const gate = Promise.withResolvers();
+  const started = Promise.withResolvers();
+  const h = host(model(async function* () {
+    calls++;
+    started.resolve();
+    await gate.promise;
+    yield { type: 'text-delta', text: '{"suggestion":"Проверь результат"}' };
+    yield finish;
+  }));
+  h.fire('session/event', session, rows[2]);
+  const available = { suggestion: null, retry: '6:0' };
+  assert.deepEqual(await h.raw('test', undefined, true), available);
+  assert.deepEqual(await h.raw('test', undefined, true), available);
+  assert.deepEqual(await h.raw('test', '6:0', true), { suggestion: null, retry: null });
+  assert.equal(calls, 0);
+  const first = h.raw('test', '6:0');
+  await started.promise;
+  const replayAvailable = { ...available, turn: 6 };
+  assert.deepEqual(await h.raw('test', undefined, true), replayAvailable);
+  const second = h.raw('test', '6:0');
+  gate.resolve();
+  const expected = { suggestion: 'Проверь результат', retry: null, turn: 6 };
+  assert.deepEqual(await Promise.all([first, second]), [expected, expected]);
+  assert.deepEqual(await h.raw('test', undefined, true), replayAvailable);
+  assert.deepEqual(await h.raw('test', '6:0'), expected);
+  assert.equal(calls, 1);
+  h.fire('session/event', session, end(7, 3));
+  assert.deepEqual(await h.raw('test', '6:0'), { suggestion: null, retry: null });
+  assert.equal(calls, 1);
+});
+
+test('manual-only generation stops after a normal empty reply or three failed attempts', async () => {
+  for (const fail of [false, true]) {
+    const { session, rows } = fixture();
+    let calls = 0;
+    const h = host(model(async function* () {
+      calls++;
+      if (fail) throw new Error('private error');
+      yield { type: 'text-delta', text: '{"suggestion":null}' };
+      yield finish;
+    }));
+    h.fire('session/event', session, rows[2]);
+    assert.deepEqual(await h.raw('test', undefined, true), { suggestion: null, retry: '6:0' });
+    assert.deepEqual(await h.raw('test', '6:0'), fail
+      ? { suggestion: null, retry: '6:1', reason: 'modelError' } : { suggestion: null, retry: null });
+    if (fail) {
+      assert.deepEqual(await h.raw('test', '6:1'), { suggestion: null, retry: '6:2', reason: 'modelError' });
+      assert.deepEqual(await h.raw('test', '6:2'), { suggestion: null, retry: null, reason: 'modelError' });
+    }
+    assert.deepEqual(await h.raw('test', '6:3'), { suggestion: null, retry: null });
+    assert.equal(calls, fail ? 3 : 1);
   }
 });
 
@@ -237,10 +390,10 @@ test('pending auto blocks manual; timeout leaves the retry available', { timeout
   const signal = await started.promise;
   assert.deepEqual(await h.raw('test', '6:1'), { suggestion: null, retry: null });
   assert.equal(calls, 1);
-  t.mock.timers.tick(12000);
+  t.mock.timers.tick(30000);
   assert.equal(signal.aborted, true);
   assert.deepEqual(await auto, { suggestion: null, retry: '6:1', reason: 'timeout' });
-  assert.deepEqual(await h.raw('test', '6:1'), { suggestion: 'Ручной результат', retry: null });
+  assert.deepEqual(await h.raw('test', '6:1'), { suggestion: 'Ручной результат', retry: null, turn: 6 });
   assert.equal(calls, 2);
   gate.resolve();
 });
@@ -253,8 +406,9 @@ test('manual pending is cancelled and never published on turn start, inbox, or d
     let calls = 0;
     const h = host(model(async function* (_options, signal) {
       calls++;
-      if (calls === 2) { started.resolve(signal); await gate.promise; }
-      yield { type: 'text-delta', text: JSON.stringify({ suggestion: calls === 1 ? null : 'Устаревший результат' }) };
+      if (calls === 1) throw new Error('provider unavailable');
+      started.resolve(signal); await gate.promise;
+      yield { type: 'text-delta', text: '{"suggestion":"Устаревший результат"}' };
       yield finish;
     }));
     h.fire('session/event', session, rows[2]);
@@ -310,7 +464,7 @@ test('failures allow manual recovery, with safe reasons and no automatic repeat'
   assert.deepEqual(await h.raw('test', '6:1'), limited);
   assert.deepEqual(await h.raw(), limited);
   assert.equal(calls, 2);
-  assert.deepEqual(await h.raw('test', '6:2'), { suggestion: 'Покажи пример', retry: null });
+  assert.deepEqual(await h.raw('test', '6:2'), { suggestion: 'Покажи пример', retry: null, turn: 6 });
   assert.deepEqual(await h.raw('test', '6:3'), { suggestion: null, retry: null });
   assert.equal(calls, 3);
 });

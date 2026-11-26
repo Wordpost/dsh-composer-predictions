@@ -2,18 +2,19 @@ import { generatePrediction, readContext, generateRewrite, readRewriteContext } 
 
 export const inject = ['connection', 'llm', 'sessions', 'agents'];
 const ROUTE = '/api/local-composer-predictions/next';
-const DEADLINE_MS = 12000;
+const PREDICTION_DEADLINE_MS = 30000;
+const REWRITE_DEADLINE_MS = 12000;
 const FRESHNESS_MS = 15 * 60 * 1000;
 const MAX_ATTEMPTS = 4; // One automatic attempt and up to three manual attempts after errors.
 
-function generateWithinDeadline(controller, generate) {
+function generateWithinDeadline(controller, deadlineMs, generate) {
   const { signal } = controller;
   if (signal.aborted) return Promise.resolve({ reason: 'cancelled' });
   const { promise: cancelled, resolve } = Promise.withResolvers();
   let timedOut = false;
   const onAbort = () => resolve({ reason: timedOut ? 'timeout' : 'cancelled' });
   signal.addEventListener('abort', onAbort, { once: true });
-  const timer = setTimeout(() => { timedOut = true; controller.abort(); }, DEADLINE_MS);
+  const timer = setTimeout(() => { timedOut = true; controller.abort(); }, deadlineMs);
 
   // Release waiters even if the provider has not reacted to the abort signal.
   return Promise.race([cancelled, generate(signal)])
@@ -38,9 +39,11 @@ export function apply(ctx) {
 
   ctx.on('session/event', (session, event) => {
     if (event.type === 'turn/start') rewrites.get(session.id)?.abort();
+    const entry = latest.get(session.id);
+    if (event.type === 'turn/end' && entry?.session === session && entry.event.seq === event.seq) return;
     if (event.type === 'turn/start' || event.type === 'turn/end') clear(session.id);
     if (event.type !== 'turn/end' || event.data.reason.kind !== 'completed'
-      || session.header.origin === 'subagent' || !session.isOwnSeq(event.seq)) return;
+      || session.header.origin === 'subagent' || event.seq < session.firstLiveSeq || !session.isOwnSeq(event.seq)) return;
     latest.set(session.id, { session, event, context: undefined, attempt: undefined, active: undefined });
   });
   ctx.on('agent/inbox/inserted', ({ agent, message }) => {
@@ -81,7 +84,7 @@ export function apply(ctx) {
       request.signal.addEventListener('abort', onAbort, { once: true });
       if (request.signal.aborted) controller.abort();
       try {
-        const result = await generateWithinDeadline(controller,
+        const result = await generateWithinDeadline(controller, REWRITE_DEADLINE_MS,
           async signal => ({ rewrite: await generateRewrite(ctx.llm, context, body.draft, signal) }));
         return response(controller.signal.aborted || ctx.sessions.get(id) !== session ? null : result.rewrite ?? null);
       } finally {
@@ -98,8 +101,8 @@ export function apply(ctx) {
     async fetch(request) {
       const params = new URL(request.url).searchParams;
       const id = params.get('session');
-      const response = ({ suggestion = null, reason } = {}, retry = null) => Response.json({
-        suggestion, retry, ...(reason === undefined ? {} : { reason }),
+      const response = ({ suggestion = null, reason } = {}, retry = null, turn) => Response.json({
+        suggestion, retry, ...(reason === undefined ? {} : { reason }), ...(turn === undefined ? {} : { turn }),
       }, {
         headers: { 'cache-control': 'no-store' },
       });
@@ -110,13 +113,14 @@ export function apply(ctx) {
         return response();
       }
       const retryKey = attempt => `${entry.event.seq}:${attempt}`;
-      const canRetry = attempt => attempt.result && !attempt.result.suggestion && attempt.number < MAX_ATTEMPTS
-        && (attempt.number === 1 || attempt.result.reason !== undefined);
+      const canRetry = attempt => attempt.result && !attempt.result.suggestion
+        && attempt.number < (entry.manualOnly ? MAX_ATTEMPTS - 1 : MAX_ATTEMPTS)
+        && attempt.result.reason !== undefined;
       const start = number => {
         const controller = new AbortController();
         entry.active = controller;
         const attempt = { number, result: undefined, pending: undefined };
-        attempt.pending = generateWithinDeadline(controller, signal => generatePrediction(ctx.llm, entry.context, signal))
+        attempt.pending = generateWithinDeadline(controller, PREDICTION_DEADLINE_MS, signal => generatePrediction(ctx.llm, entry.context, signal))
           .then(result => {
             if (entry.active === controller) entry.active = undefined;
             return attempt.result = result;
@@ -124,15 +128,24 @@ export function apply(ctx) {
         entry.attempt = attempt;
       };
       const retry = params.get('retry');
-      if (retry !== null) {
-        const previous = entry.attempt;
-        if (previous && retry === retryKey(previous.number) && canRetry(previous)) start(previous.number + 1);
-        else if (!previous || previous.number === 1 || retry !== retryKey(previous.number - 1)) return response();
-        // Resending the same key joins or retrieves its attempt without starting another model call.
-      } else if (!entry.attempt) {
+      const availability = params.has('availability');
+      if (availability && retry !== null) return response();
+      const previous = entry.attempt;
+      if (!previous) {
+        if (retry !== null && retry !== retryKey(0)) return response();
         if (entry.context === undefined) entry.context = readContext(entry.session, entry.event);
         if (!entry.context) return response();
+        if (availability) return response(undefined, retryKey(0));
+        entry.manualOnly = retry !== null;
         start(1);
+      } else if (availability) {
+        // A click can retrieve a cached suggestion or join an in-flight attempt.
+        if (!previous.result || previous.result.suggestion) return response(undefined, retryKey(previous.number - 1), entry.event.seq);
+        return response(previous.result, canRetry(previous) ? retryKey(previous.number) : null);
+      } else if (retry !== null) {
+        if (retry === retryKey(previous.number) && canRetry(previous)) start(previous.number + 1);
+        else if (retry !== retryKey(previous.number - 1)) return response();
+        // Resending the same key joins or retrieves its attempt without starting another model call.
       }
       const attempt = entry.attempt;
       const result = await attempt.pending;
@@ -142,7 +155,7 @@ export function apply(ctx) {
         return response();
       }
       if (entry.attempt !== attempt) return response();
-      return response(result, canRetry(attempt) ? retryKey(attempt.number) : null);
+      return response(result, canRetry(attempt) ? retryKey(attempt.number) : null, result.suggestion ? entry.event.seq : undefined);
     },
   });
 }
